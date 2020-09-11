@@ -29,8 +29,6 @@
     This is the report author.  Their name appears in the lower right corner of the title page.
 .PARAMETER Vendor
     This displays a company name in the lower right corner of the title page.
-.PARAMETER Software
-    Specifies whether the script should run an inventory of Applications, Packages and OSD related objects.
 .PARAMETER ListAllInformation
     Specifies whether the script should only output an overview of what is configured (like count of collections) or 
     a full output with verbose information. This includes: User & Device collections, Application, Packages, ADR Deployments, 
@@ -46,8 +44,16 @@
 .PARAMETER UnknownClientSettings
     With new releases of CM come new client settings.  If this parameter is added, it will display raw 
     information for these client settings.
+.PARAMETER SQLTimeout
+    The amount of time we should wait for a sql query to time out.  Default is 300 seconds (5 minutes)
 .PARAMETER MaskAccounts
     This will mask about half of the account name in the documentation
+.PARAMETER SQLCredential
+    If The SQL server is on a remote system, you can pass SQL credentials here.
+.PARAMETER SkipRemoteServerDetails
+    Skip connecting directly to each remote site system server for hardware and OS details since this can take a long time on sites with many site systems
+.PARAMETER StyleSheet
+    This is the path to an external CSS file that will allow you to style the report in your own way.  The style sheet will be embedded into the report.
 .EXAMPLE
 	DocumentCMCB.ps1 -ListAllInformation
 .EXAMPLE
@@ -61,11 +67,11 @@
 	This script creates a HTML document.
 .NOTES
 	NAME: DocumentCMCB.ps1
-	VERSION: 3.35
+	VERSION: 3.57
 	AUTHOR: Paul Wetter
         Based on original script developed by David O'Brien
     	CONTRIBUTOR: Florian Valente (BlackCatDeployment)
-	LASTEDIT: November 6, 2018
+	LASTEDIT: August 29, 2020
 #>
 
 #endregion
@@ -111,13 +117,25 @@ Param(
     [parameter(Mandatory=$False)] 
     [switch]$NoSqlDetail,
 
+    [parameter(Mandatory=$False)]
+    [int]$SQLTimeout = 300,
+
     [parameter(Mandatory=$False)] 
-    [switch]$MaskAccounts
+    [switch]$MaskAccounts,
+    
+    #[parameter(Mandatory=$False)] 
+    #[System.Management.Automation.PSCredential]$SQLCredential = [System.Management.Automation.PSCredential]::Empty,
+
+    [parameter(Mandatory=$False,HelpMessage="Skip connecting directly to each site system server for hardware and OS details")]
+    [switch]$SkipRemoteServerDetails,
+
+    [parameter(Mandatory=$False,HelpMessage="CSS file path")]
+    [string]$StyleSheet = ""
 
 	)
 #endregion script parameters
 
-$DocumenationScriptVersion = 3.35
+$DocumenationScriptVersion = '3.57'
 
 
 $CMPSSuppressFastNotUsedCheck = $true
@@ -198,6 +216,9 @@ Function Write-HtmlTable{
         $table = $table -replace "--/I--","</I>"
         $table = $table -replace "--U--","<U>"
         $table = $table -replace "--/U--","</U>"
+        $table = $table -replace "--CBOX--","&#9745;"
+        $table = $table -replace "--UNCBOX--","&#9744;"
+        $table = $table -replace "--BULLET--","&bull;"
     }else{
         Write-Verbose 'Input object was empty outputting empty object paragraph text...'
         Write-HTMLParagraph -Text 'There was no data to output from this query.' -Level $Level -File $file
@@ -422,6 +443,9 @@ Function Write-HTMLHeader{
         HelpMessage="This is the text that will appear in title tag of the header")]
         [string]$Title,
         [Parameter(Mandatory=$false,ValueFromPipeline=$false,
+        HelpMessage="Custom Style sheet to apply to the domcumenation")]
+        [string]$CssStyleFile,
+        [Parameter(Mandatory=$false,ValueFromPipeline=$false,
         HelpMessage="This is the amount of space that the table will indent by")]
         [string]$File
     )
@@ -429,18 +453,39 @@ Function Write-HTMLHeader{
     $Header += "<html>"
     $Header += "<Head>"
     $Header += "<Title>$Title</Title>"
-    $Header += "<Style>"
-    $Header += 'H1  {background-color:royalblue; border-top: 1px solid black;}'
-    $Header += 'H2	{margin-left:10px;background-color:steelblue; border-top: 1px solid black;}'
-    $Header += 'H3	{margin-left:20px;background-color:lightblue; border-top: 1px solid black;}'
-    $Header += 'H4	{margin-left:30px;background-color:lightsteelblue; border-top: 1px solid black;}'
-    $Header += 'H5	{margin-left:40px;background-color:lightcyan; border-top: 1px solid black;}'
-    $Header += 'H6	{margin-left:50px;background-color:lavender; border-top: 1px solid black;}'
-    $Header += ".pagebreak { page-break-before: always; }"
-    $Header += "TH  {background-color:LightBlue;padding: 3px; border: 2px solid black;}"
-    $Header += "TD  {padding: 3px; border: 1px solid black;}"
-    $Header += "TABLE	{border-collapse: collapse;}"
-    $Header += "</Style>"
+    # if custom stylesheet parameter is invoked, apply to output, otherwise use hard-coded style
+    ##Default Style
+    $DefaultStyle = @()
+    $DefaultStyle += "<Style>"
+    $DefaultStyle += 'H1  {background-color:royalblue; border-top: 1px solid black;}'
+    $DefaultStyle += 'H2	{margin-left:10px;background-color:steelblue; border-top: 1px solid black;}'
+    $DefaultStyle += 'H3	{margin-left:20px;background-color:lightblue; border-top: 1px solid black;}'
+    $DefaultStyle += 'H4	{margin-left:30px;background-color:lightsteelblue; border-top: 1px solid black;}'
+    $DefaultStyle += 'H5	{margin-left:40px;background-color:lightcyan; border-top: 1px solid black;}'
+    $DefaultStyle += 'H6	{margin-left:50px;background-color:lavender; border-top: 1px solid black;}'
+    $DefaultStyle += ".pagebreak { page-break-before: always; }"
+    $DefaultStyle += "TH  {background-color:LightBlue;padding: 3px; border: 2px solid black;}"
+    $DefaultStyle += "TD  {padding: 3px; border: 1px solid black;}"
+    $DefaultStyle += "TABLE	{border-collapse: collapse;}"
+    $DefaultStyle += "TABLE.Cover TR {background-color:white}"
+    $DefaultStyle += ".CoverImage {width:auto; max-width:auto}"
+    $DefaultStyle += "</Style>"
+    ##End Default Style
+    If($CssStyleFile){
+        If(Test-Path -Path $CssStyleFile) {
+            $StyleContent = Get-Content "$CssStyleFile"
+            Write-Verbose "Applying custom style sheet to document: $CssStyleFile"
+            $Header += "<Style>"
+            $Header += $StyleContent
+            $Header += "</Style>"
+        }
+        else {
+            Write-Verbose "Custom style sheet not found [$CssStyleFile].  Using default style."
+            $Header += $DefaultStyle
+        }
+    }Else{
+        $Header += $DefaultStyle
+    }
     $Header += "</Head>"
     $Header += "<Body>"
     If ($File) {IF (Test-Path -Path $File) {Remove-Item -Path $File -Force}}
@@ -526,14 +571,14 @@ Function Write-HTMLCoverPage{
         [string]$File
     )
     $Cover = @()
-    $Cover += "<Table border=0 cellspacing=0 cellpadding=0 style=`"width:100%;border: 0px`">"
+    $Cover += "<Table class=`"Cover`" border=0 cellspacing=0 cellpadding=0 style=`"width:100%;border: 0px`">"
     $Cover += "<TR><TD Height=50 VAlign=`"top`" align=`"left`" style=`"border: 0px;font-size:48pt`">$Title</TD></TR>"
     $Cover += "<TR><TD Height=20 VAlign=`"top`" align=`"left`" style=`"border: 0px;font-size:24pt;padding-left:10px`">Report Prepared for: $Org</TD></TR>"
     If ($ImagePath){
         $ImageData=Convert-Image2Base64 -Path $ImagePath
     }
     If ($ImageData){
-        $Cover += "<TR><TD Height=700 VAlign=`"bottom`" align=`"right`" style=`"border: 0px`"><img src=`"$ImageData`"></TD></TR>"
+        $Cover += "<TR><TD Height=700 VAlign=`"bottom`" align=`"right`" style=`"border: 0px`"><img class=`"CoverImage`" src=`"$ImageData`"></TD></TR>"
     }Else{
         $Cover += "<TR><TD Height=700 VAlign=`"top`" style=`"border: 0px`">&nbsp;</TD></TR>"
     }
@@ -654,15 +699,6 @@ function Write-HtmlComment{
     )
     "<!--$Text-->" | Out-File -filepath $File -Append
 }
-
-
-#$folders=Get-ChildItem -Path 'C:\AMD\WU-CCC2\ccc2_install' | Where {$_.PSIsContainer -eq $false} | select Name,FullName,Mode,Length
-#Write-HTMLHeadLine -Text "Applications" -Level 2 -PageBreak
-#Write-HTMLParagraph -Text "Please read this text. It is good to share with all." -Indent 20
-#Write-HtmlTable -InputObject $folders -Border 1 -Indent 25
-#Write-HTMLHeadLine -Text "Programs" -Level 2
-#Write-HTMLParagraph -Text "Please read this text. It is good to share with all. Don't indent." -Indent 20
-#Write-HtmlTable -InputObject $folders -Border 1 -Indent 25
 
 ##########################################################################################################################
 ###############################################HTML Format functions above################################################
@@ -864,23 +900,99 @@ Function Get-SiteCode
   return $SiteCode
 }
 
-#small funtion that will convert utc time to local time, and ignore daylight savings time.
+#small funtion that will convert utc time to local time, option to ignore daylight savings time.
 function Convert-UTCtoLocal{
     param(
         [parameter(Mandatory=$true)]
         [String]$UTCTimeString,
         [parameter(Mandatory=$false)]
-        [Switch]$RespectDST
+        [Switch]$IgnoreDST
     )
     $UTCTime = ($UTCTimeString.Split('.'))[0]
     $dt = ([datetime]::ParseExact($UTCTime,'yyyyMMddhhmmss',$null))
-    if ($RespectDST){
+    if ($IgnoreDST){
+        $dt+([System.TimeZoneInfo]::Local).BaseUtcOffset
+    }else{
         $strCurrentTimeZone = (Get-WmiObject win32_timezone).StandardName
         $TZ = [System.TimeZoneInfo]::FindSystemTimeZoneById($strCurrentTimeZone)
         [System.TimeZoneInfo]::ConvertTimeFromUtc($dt, $TZ)
-    }else{
-        $dt+([System.TimeZoneInfo]::Local).BaseUtcOffset
     }
+}
+
+Function Get-HumanReadableSchedule {
+    <#
+    .SYNOPSIS
+    This reads the data from an CM schedule object and then converts the schedule into a readable text similar to what appears in the console dialogs
+    
+    .PARAMETER Schedule
+    this is a schedule object from within CM.  Schedules are converted from a 16 digit hex string with Convert-CMSchedule
+    
+    .EXAMPLE
+    Get-HumanReadableSchedule -Schedule (Convert-CMSchedule -ScheduleString 0001170000100038)
+    
+    .NOTES
+    Author: Paul Wetter
+    Website: 
+    Email: tellwetter[at]gmail.com
+    #>
+    
+    [CmdletBinding()]
+    param(
+        $Schedule
+    )
+    if ($Schedule.HourDuration -gt 0) {
+        $HrDuration = ", with a duration of $($Schedule.HourDuration) hours"
+    } 
+    elseif ($Schedule.MinuteDuration -gt 0) {
+        $HrDuration = ", with a duration of $($Schedule.MinuteDuration) minutes"
+    } 
+    elseif ($Schedule.DayDuration -gt 0) {
+        $HrDuration = ", with a duration of $($Schedule.DayDuration) days"
+    }
+
+    if ($Schedule.DaySpan -gt 0) {
+        $HrSched = "Occurs every $($Schedule.DaySpan) days effective $($Schedule.StartTime)$HrDuration"
+    }
+    elseif ($Schedule.HourSpan -gt 0) {
+        $HrSched = "Occurs every $($Schedule.HourSpan) hours effective $($Schedule.StartTime)$HrDuration"
+    }
+    elseif ($Schedule.MinuteSpan -gt 0) {
+        $HrSched = "Occurs every $($Schedule.MinuteSpan) minutes effective $($Schedule.StartTime)$HrDuration"
+    }
+    elseif ($Schedule.ForNumberOfWeeks) {
+        $HrSched = "Occurs every $($Schedule.ForNumberOfWeeks) weeks on $(Convert-WeekDay $Schedule.Day) effective $($Schedule.StartTime)$HrDuration"
+    }
+    elseif ($Schedule.ForNumberOfMonths) {
+        if ($Schedule.MonthDay -gt 0) {
+            $HrSched = "Occurs on day $($Schedule.MonthDay) of every $($Schedule.ForNumberOfMonths) months effective $($Schedule.StartTime)$HrDuration"
+        }
+        elseif ($Schedule.MonthDay -eq 0) {
+            $HrSched = "Occurs the last day of every $($Schedule.ForNumberOfMonths) months effective $($Schedule.StartTime)$HrDuration"
+        }
+        elseif ($Schedule.WeekOrder -gt 0) {
+            switch ($Schedule.WeekOrder) {
+                0 { $order = 'last' }
+                1 { $order = 'first' }
+                2 { $order = 'second' }
+                3 { $order = 'third' }
+                4 { $order = 'fourth' }
+            }
+            $HrSched = "Occurs the $($order) $(Convert-WeekDay $Schedule.Day) of every $($Schedule.ForNumberOfMonths) months effective $($Schedule.StartTime)$HrDuration"
+        }
+    }
+    elseif ($Schedule.HourDuration -gt 0) {
+        $HrSched = "Occurs on $($Schedule.StartTime), with a duration of $($Schedule.HourDuration) hours"
+    } 
+    elseif ($Schedule.MinuteDuration -gt 0) {
+        $HrSched = "Occurs on $($Schedule.StartTime), with a duration of $($Schedule.MinuteDuration) minutes"
+    } 
+    elseif ($Schedule.DayDuration -gt 0) {
+        $HrSched = "Occurs on $($Schedule.StartTime), with a duration of $($Schedule.DayDuration) days"
+    }
+    else {
+        $HrSched = "Could not calculate schedule"
+    }
+    return $HrSched
 }
 
 ##Recursively processes through all the conditions in a task sequence step.
@@ -891,6 +1003,7 @@ function Process-TSConditions{
     If($condition.osConditionGroup){
         $OSCondition = $condition.osConditionGroup.osExpressionGroup.name -join ", $($condition.osConditionGroup.type) "
         "$($prefix)Operating System Equals: $OSCondition"
+        Remove-Variable OSCondition -ErrorAction Ignore
     }
     If($condition.expression){
         $expressions = $condition.expression
@@ -922,6 +1035,7 @@ function Process-TSConditions{
                         }
                     }
                     "$($prefix)Task Sequence Variable: $ExpVariable $ExpOperator $ExpValue"
+                    Remove-Variable ExpVariable,ExpOperator,ExpValue -ErrorAction Ignore
                 }
                 'SMS_TaskSequence_FileConditionExpression'{
                     If(('Path' -in ($expression.variable).name) -and ('DateTimeOperator' -notin ($expression.variable).name) -and ('VersionOperator' -notin ($expression.variable).name)){
@@ -939,6 +1053,7 @@ function Process-TSConditions{
                         #'DateTimeOperator' -in ($expression.variable).name
                         #'VersionOperator' -in ($expression.variable).name
                         "$($prefix)File: $FilePath     File Version: $FileVersionOperator $FileVersion     File Date: $FileDateOperator $FileDate"
+                        Remove-Variable FileDate,FileDateOperator,FilePath,FileVersion,FileVersionOperator -ErrorAction Ignore
                     }
                 }
                 'SMS_TaskSequence_FolderConditionExpression'{
@@ -955,6 +1070,7 @@ function Process-TSConditions{
                         #'DateTimeOperator' -in ($expression.variable).name
                         #'VersionOperator' -in ($expression.variable).name
                         "$($prefix)Folder: $FolderPath     Folder Date: $FolderDateOperator $FolderDate"
+                        Remove-Variable FolderPath,FolderDateOperator,FolderDate -ErrorAction Ignore
                     }
                 }
                 'SMS_TaskSequence_RegistryConditionExpression'{
@@ -968,6 +1084,7 @@ function Process-TSConditions{
                         }
                     }
                     "$($prefix)Registry Value: $RegKeyPath $RegValue ($RegType) $RegOperator $RegData"
+                    Remove-Variable RegKeyPath,RegValue,RegType,RegOperator,RegData -ErrorAction Ignore
                 }
                 'SMS_TaskSequence_SoftwareConditionExpression'{
                     foreach ($pair in $expression.variable){
@@ -975,7 +1092,7 @@ function Process-TSConditions{
                             'Operator'{$AppOperator = $pair.'#text'}
                             'ProductCode'{$AppProductCode = $pair.'#text'}
                             'ProductName'{$AppProductName = $pair.'#text'}
-                            'UpgradeCode'{$AppUpgradeCode = $pair.'#text'}
+                            #'UpgradeCode'{$AppUpgradeCode = $pair.'#text'}
                             'Version'{$AppVersion = $pair.'#text'}
                         }
                     }
@@ -984,6 +1101,7 @@ function Process-TSConditions{
                     }else{
                         "$($prefix)Installed Software: Exact Version of `"$AppProductName`", Version: $AppVersion, Product Code: $AppProductCode"
                     }
+                    Remove-Variable AppOperator,AppProductCode,AppProductName,AppUpgradeCode,AppVersion -ErrorAction Ignore
                 }
             }
         }
@@ -1035,6 +1153,7 @@ Function Process-TSSteps{
                     #"$($node.name) $($node.action)"
                 }
                 Remove-Variable Conditions -ErrorAction Ignore
+                Remove-Variable StepDescription -ErrorAction Ignore
                 $TSStep
             }
             'subtasksequence'{
@@ -1073,6 +1192,7 @@ Function Process-TSSteps{
                     #"$($node.name) $($node.action)"
                 }
                 Remove-Variable Conditions -ErrorAction Ignore
+                Remove-Variable StepDescription -ErrorAction Ignore
                 $TSStep
             }
             'group'{
@@ -1101,6 +1221,7 @@ Function Process-TSSteps{
                 #"Group: $($node.Name)"
                 $TSStep = New-Object -TypeName psobject -Property @{'Group Name'="$($node.Name)";'Step Name'="N/A";'Description'="$StepDescription";'Action'="N/A";'Continue on Error'="$StepContinueError";'Status'="$StepStatus";'Conditions'="$Conditions"}
                 Remove-Variable Conditions -ErrorAction Ignore
+                Remove-Variable StepDescription -ErrorAction Ignore
                 $TSStep
                 Process-TSSteps -Sequence $node -GroupName "$($node.Name)" -TSSteps $TSSteps -StepCounter $TSStepNumber
             }
@@ -1113,7 +1234,7 @@ Function Set-AccountMask{
     [CmdletBinding()]
     param (
         [Parameter(Mandatory=$True,ValueFromPipeline=$true,
-        HelpMessage="This is the SQL server for the SCCM Site")]
+        HelpMessage="This is the Account that you want to mask the name with ***.")]
         [string]$Account
     )
     Begin{}
@@ -1131,6 +1252,941 @@ Function Set-AccountMask{
     }
     End{}
 }
+
+Function Get-PWCMDiscoveryMethod {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SiteServer = $env:COMPUTERNAME,
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SiteName = (Get-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\CCM\CcmEval -Name LastSiteCode -ErrorAction SilentlyContinue).LastSiteCode,
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('ActiveDirectoryForestDiscovery', 'ActiveDirectoryGroupDiscovery', 'ActiveDirectorySystemDiscovery', 'ActiveDirectoryUserDiscovery', 'NetworkDiscovery', 'HeartbeatDiscovery')]
+        [ValidateNotNullOrEmpty()]
+        $DiscoveryMethod
+    )
+    
+    switch ($DiscoveryMethod) {
+        'ActiveDirectoryForestDiscovery' { $DMX = 1 }
+        'ActiveDirectoryGroupDiscovery' { $DMX = 2 }
+        'ActiveDirectorySystemDiscovery' { $DMX = 3 }
+        'ActiveDirectoryUserDiscovery' { $DMX = 4 }
+        'NetworkDiscovery' { $DMX = 5 }
+        'HeartbeatDiscovery' { $DMX = 6 }
+        Default { $DMX = 7 }
+    }
+
+    #region AD Group Discovery
+    If ($dmx -eq 2 -or $DMX -eq 7) {
+        $ADGDHash = @{ }
+        $ADGroupDiscovery = Get-WmiObject -Query "SELECT * FROM SMS_SCI_Component WHERE FileType=2 AND ItemName='SMS_AD_SECURITY_GROUP_DISCOVERY_AGENT|SMS Site Server' AND ItemType='Component'" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer
+        $ADGDHash.Add('DiscoveryMethod', 'Active Directory Group Discovery')
+        foreach ($Prop in $ADGroupDiscovery.Props) {
+            #schedule and suches
+            switch ($Prop.PropertyName) {
+                'Enable Incremental Sync' {
+                    If ($Prop.Value -eq 1) {
+                        $ADGDHash.Add('IncrementalSyncState', 'Enabled')
+                    }
+                    Else {
+                        $ADGDHash.Add('IncrementalSyncState', 'Disabled')
+                    }
+                }
+                'Startup Schedule' {
+                    $schedule = Convert-CMSchedule $prop.Value1
+                    $IncSchedule = Get-HumanReadableSchedule -Schedule $schedule
+                    $ADGDHash.Add('IncrementalSyncSchedule', "$IncSchedule")
+                }
+                'Full Sync Schedule' {
+                    $GDFullSched = Convert-CMSchedule $prop.Value1
+                    $FullSchedule = Get-HumanReadableSchedule -Schedule $GDFullSched
+                    $ADGDHash.Add('FullSyncSchedule', "$FullSchedule")
+                }
+                'SETTINGS' {
+                    If ($Prop.Value1 -eq 'ACTIVE') {
+                        $ADGDHash.Add('DiscoveryState', 'Enabled')
+                    }
+                    else {
+                        $ADGDHash.Add('DiscoveryState', 'Disabled')
+                    }
+                }
+                'Discover DG Membership' {
+                    If ($Prop.Value -eq 1) {
+                        $ADGDHash.Add('DistributionGroupDiscoveryState', 'Enabled')
+                    }
+                    Else {
+                        $ADGDHash.Add('DistributionGroupDiscoveryState', 'Disabled')
+                    }
+                }
+                'Enable Filtering Expired Logon' {
+                    If ($Prop.Value -eq 1) {
+                        $ADGDHash.Add('FilterExpiredLogonState', 'Enabled')
+                    }
+                    Else {
+                        $ADGDHash.Add('FilterExpiredLogonState', 'Disabled')
+                    }
+                }
+                'Days Since Last Logon' {
+                    $ADGDHash.Add('FilterExpiredLogonTime', $Prop.Value)
+                }
+                'Enable Filtering Expired Password' {
+                    If ($Prop.Value -eq 1) {
+                        $ADGDHash.Add('FilterExpiredPasswordState', 'Enabled')
+                    }
+                    Else {
+                        $ADGDHash.Add('FilterExpiredPasswordState', 'Disabled')
+                    }
+                }
+                'Days Since Last Password Set' {
+                    $ADGDHash.Add('FilterExpiredPasswordTime', $Prop.Value)
+                }
+            }    
+        }
+        $adgroupd = @()
+        $ADGroupSearch = @()
+        $ADGroupSearchCred = @()
+        $start = 0
+        foreach ($List in $ADGroupDiscovery.PropLists) {
+            #Domains and Groups
+            switch -wildcard ($List.PropertyListName) {
+                'AD Containers' {
+                    foreach ($value in $List.values) {
+                        $start++
+                        switch ($start) {
+                            1 { $one = $value }
+                            2 { $two = $value }
+                            3 { $three = $value }
+                            4 {
+                                $adgroupd += [pscustomobject]@{'Domain' = $one; 'val1' = $two; 'val2' = $three; 'val3' = $value }
+                                Remove-Variable one, two, three
+                                $start = 0
+                            }
+                        }
+                    }
+                }
+                'Search Bases:*' {
+                    $SearchDomain = $List.PropertyListName -replace 'Search Bases:', ''
+                    $ADGroupSearch += [pscustomobject]@{'Domain' = $SearchDomain; 'SearchBase' = "$($List.Values -join ';')" }
+                }
+                'AD Accounts:*' {
+                    $AccountDomain = $List.PropertyListName -replace 'AD Accounts:', ''
+                    $ADGroupSearchCred += [pscustomobject]@{'Domain' = $AccountDomain; 'Account' = "$($List.Values[0])" }
+                }
+            }
+        }
+        $ADGroupSearchLocations = @()
+        foreach ($ADGD in $adgroupd) {
+            If ($ADGD.val1 -eq 0) {
+                $ADGDType = 'Location'
+            }
+            else {
+                $ADGDType = 'Groups'
+            }
+            if ($ADGD.val2 -eq 0) {
+                $ADGDRecursive = 'Yes'
+            }
+            else {
+                $ADGDRecursive = 'No'
+                IF ($ADGDType -like 'Groups') { $ADGDRecursive = 'Not Applicable' }
+            }
+            $ADGDAccount = 'Site Server'
+            foreach ($account in $ADGroupSearchCred) {
+                If ($account.Domain -like $ADGD.Domain) {
+                    $ADGDAccount = "$($account.Account)"
+                }
+            }
+            foreach ($SB in $ADGroupSearch) {
+                If ($SB.Domain -like $ADGD.Domain) {
+                    $ADGDSearchBase = "$($SB.SearchBase)"
+                }
+            }
+            $ADGroupSearchLocations += [pscustomobject]@{'Name' = "$($ADGD.Domain)"; 'Type' = "$ADGDType"; 'Recursive' = "$ADGDRecursive"; 'Account' = "$ADGDAccount"; 'SearchBase' = $ADGDSearchBase }
+        }
+        $ADGDHash.Add('SearchLocations', $ADGroupSearchLocations)
+        [PSCustomObject]$ADGDHash
+    }
+    #endregion AD Group Discovery
+
+    #region AD Forest Discovery
+    If ($dmx -eq 1 -or $DMX -eq 7) {
+        $ADFDHash = @{ }
+        $ADFDHash.Add('DiscoveryMethod', 'Active Directory Forest Discovery')
+        $ADForestDiscovery = Get-WmiObject -Query "SELECT * FROM SMS_SCI_Component WHERE FileType=2 AND ItemName='SMS_AD_FOREST_DISCOVERY_MANAGER|SMS Site Server' AND ItemType='Component'" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer
+        foreach ($Prop in $ADForestDiscovery.Props) {
+            switch ($Prop.PropertyName) {
+                'Startup Schedule' {
+                    $FDSchedule = Convert-CMSchedule $prop.Value1
+                    $ADFDHash.Add('SyncSchedule', "$(Get-HumanReadableSchedule -Schedule $FDSchedule)")
+                }
+                'SETTINGS' {
+                    If ($Prop.Value1 -eq 'ACTIVE') {
+                        $ADFDHash.Add('DiscoveryState', 'Enabled')
+                    }
+                    else {
+                        $ADFDHash.Add('DiscoveryState', 'Disabled')
+                    }
+                }
+                'Enable AD Site Boundary Creation' {
+                    If ($Prop.Value -eq 1) {
+                        $ADFDHash.Add('ADSiteBoundaryCreation', 'Enabled')
+                    }
+                    Else {
+                        $ADFDHash.Add('ADSiteBoundaryCreation', 'Disabled')
+                    }
+                }
+                'Enable Subnet Boundary Creation' {
+                    If ($Prop.Value -eq 1) {
+                        $ADFDHash.Add('SubnetBoundaryCreation', 'Enabled')
+                    }
+                    Else {
+                        $ADFDHash.Add('SubnetBoundaryCreation', 'Disabled')
+                    }
+                }
+            }    
+        }
+        [PSCustomObject]$ADFDHash
+    }
+    #endregion AD Forest Discovery
+
+    #region Heartbeat Discovery
+    If ($dmx -eq 6 -or $DMX -eq 7) { 
+        $HBDHash = @{ }
+        $HBDHash.Add('DiscoveryMethod', 'Heartbeat Discovery')
+        $HeartbeatDiscovery = Get-WmiObject -Query "SELECT * FROM SMS_SCI_ClientConfig WHERE FileType=2 AND ItemName='Client Properties' AND ItemType='Client Configuration'" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer
+        Foreach ($prop in $HeartbeatDiscovery.Props) {
+            switch ($prop.PropertyName) {
+                'DDR Refresh Interval' {
+                    $schedule = Convert-CMSchedule $prop.Value2
+                    If ($schedule.DaySpan -ne 0){
+                        If(($schedule.DaySpan % 7) -eq 0){
+                            $weeks = $schedule.DaySpan/7
+                            $DDRInterval = "Every $weeks week(s)"
+                        } else {
+                            $DDRInterval = "Every $($schedule.DaySpan) day(s)"
+                        }
+                    } elseif ($schedule.HourSpan -ne 0) {
+                        $DDRInterval = "Every $($schedule.HourSpan) hour(s)"
+                    }
+                    $HBDHash.Add('DDRRefreshInterval', "$DDRInterval")
+                }
+                'Enable Heartbeat DDR' { 
+                    If ($Prop.Value -eq 1) {
+                        $HBDHash.Add('DiscoveryState', 'Enabled')
+                    }
+                    Else {
+                        $HBDHash.Add('DiscoveryState', 'Disabled')
+                    }
+                }
+            }
+        }
+        [PSCustomObject]$HBDHash
+    }
+    #endregion Heartbeat Discovery
+
+    #region Network Discovery
+    If ($dmx -eq 5 -or $DMX -eq 7) {
+        $NDHash = @{ }
+        $NDHash.Add('DiscoveryMethod', 'Network Discovery')
+        $NetworkDiscovery = Get-WmiObject -Query "SELECT * FROM SMS_SCI_Component WHERE FileType=2 AND ItemName='SMS_NETWORK_DISCOVERY|SMS Site Server' AND ItemType='Component'" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer
+        Foreach ($prop in $NetworkDiscovery.Props) {
+            switch ($prop.PropertyName) {
+                'Discovery Enabled' {
+                    If ($Prop.Value1 -eq "TRUE") {
+                        $NDHash.Add('DiscoveryState', 'Enabled')
+                    }
+                    Else {
+                        $NDHash.Add('DiscoveryState', 'Disabled')
+                    }
+                }
+                'Subnet Include Local' {
+                    If ($Prop.Value1 -eq "TRUE") {
+                        $NDHash.Add('IncludeLocalSubnets', 'Enabled')
+                    }
+                    Else {
+                        $NDHash.Add('IncludeLocalSubnets', 'Disabled')
+                    }
+                }
+                'Domain Include Local' {
+                    If ($Prop.Value1 -eq "TRUE") {
+                        $NDHash.Add('IncludeLocalDomain', 'Enabled')
+                    }
+                    Else {
+                        $NDHash.Add('IncludeLocalDomain', 'Disabled')
+                    }
+                }
+                'Router Hop Count' {
+                    $NDHash.Add('SNMPMaxHopCount', $prop.Value1)
+                }
+                'DHCP Include Local' {
+                    If ($Prop.Value1 -eq "TRUE") {
+                        $NDHash.Add('IncludeLocalDHCP', 'Enabled')
+                    }
+                    Else {
+                        $NDHash.Add('IncludeLocalDHCP', 'Disabled')
+                    }
+                }
+                'ICMP Ping Timeout' {
+                    If ($Prop.Value1 -eq 2000) {
+                        $NDHash.Add('SlowNetwork', 'Enabled')
+                    }
+                    Else {
+                        $NDHash.Add('SlowNetwork', 'Disabled')
+                    }
+                }
+                'Startup Schedule' {
+                    If ($prop.Value1) {
+                        $SchedVal = $prop.Value1 -split ''
+                        $schedules = foreach ($bb in $SchedVal) {
+                            $cc = "$cc$bb"
+                            If ($cc.length -eq 16) {
+                                $cc
+                                $cc = ''
+                            }
+                        }
+                        Remove-Variable cc, bb
+                        $NDschedules = @()
+                        foreach ($schedule in $schedules) {
+                            $Sched = Convert-CMSchedule $schedule
+                            $NDschedules += "$(Get-HumanReadableSchedule -Schedule $Sched)"
+                        }
+                        $NDHash.Add('DiscoverySchedule', $NDschedules)
+                    }
+                }
+            }
+        }
+        $NDSubnets = @()
+        $NDDomains = @()
+        $NDSnmp = @()
+        $NDSnmpDevices = @()
+        $NDDHCPServers = @()
+        foreach ($List in $NetworkDiscovery.PropLists) {
+            Switch ($List.PropertyListName) {
+                'Subnet Include' {
+                    Foreach ($Value in $List.Values) {
+                        $SN = $Value.Split(' ')
+                        $NDSubnets += [pscustomobject]@{'Network' = "$($SN[0])"; 'Subnet Mask' = "$($SN[1])"; 'Search' = 'Enabled' }
+                    }
+                }
+                'Subnet Exclude' {
+                    Foreach ($Value in $List.Values) {
+                        $SN = $Value.Split(' ')
+                        $NDSubnets += [pscustomobject]@{'Network' = "$($SN[0])"; 'Subnet Mask' = "$($SN[1])"; 'Search' = 'Disabled' }
+                    }
+                }
+                'Domain Include' {
+                    Foreach ($Value in $List.Values) {
+                        $NDDomains += [pscustomobject]@{'Domain' = "$Value"; 'Search' = 'Enabled' }
+                    }
+                }
+                'Domain Exclude' {
+                    Foreach ($Value in $List.Values) {
+                        $NDDomains += [pscustomobject]@{'Domain' = "$Value"; 'Search' = 'Disabled' }
+                    }
+                }
+                'Community Names' {
+                    foreach ($Value in $List.Values) {
+                        $NDSnmp += "$Value"
+                    }
+                }
+                'Address Include' {
+                    foreach ($Value in $List.Values) {
+                        $NDSnmpDevices += "$Value"
+                    }
+                }
+                'DHCP Include' {
+                    foreach ($Value in $List.Values) {
+                        $NDDHCPServers += "$Value"
+                    }
+                }
+                'Network Discovery Protocols' {
+                    #{DHCP, OSPF} = always set to this.
+                }
+                'Address Discovery Protocols' {
+                    Switch ($List.values -join ',') {
+                        'OSPF,RIP' { $NDADP = 1 }
+                        'OSPF,RIP,NETBIOS,DHCP' { $NDADP = 2 }
+                    }
+                }
+                'Address Validation Protocols' {
+                    Switch ($List.values -join ',') {
+                        'ICMP,NAME_RESOLVE' { $NDAVP = 1 }
+                        'ICMP,NAME_RESOLVE,NETBIOS' { $NDAVP = 2 }
+                    }
+                }
+            }
+        }
+        If ($NDADP -eq 1) {
+            $NDType = 'Topology'
+        }
+        else {
+            if ($NDADP -eq 2) {
+                If ($NDAVP -eq 1) {
+                    $NDType = 'Topology and client'
+                }
+                else {
+                    if ($NDAVP -eq 2) {
+                        $NDType = 'Topology, client, and client operating system'
+                    }
+                }
+            }
+        }
+        $NDHash.Add('DiscoveryType', $NDType)
+        $NDHash.Add('SearchSubnets', $NDSubnets)
+        $NDHash.Add('SearchDomains', $NDDomains)
+        $NDHash.Add('SearchSNMPCommunities', $NDSnmp)
+        $NDHash.Add('SearchSNMPDevices', $NDSnmpDevices)
+        $NDHash.Add('SearchDHCPServers', $NDDHCPServers)
+        [PSCustomObject]$NDHash
+    }
+    #endregion Network Discovery
+
+    #region AD System Discovery
+    If ($dmx -eq 3 -or $DMX -eq 7) {
+        $ADSDHash = @{ }
+        $ADSDHash.Add('DiscoveryMethod', 'Active Directory System Discovery')
+        $ADSystemDiscovery = Get-WmiObject -Query "SELECT * FROM SMS_SCI_Component WHERE FileType=2 AND ItemName='SMS_AD_SYSTEM_DISCOVERY_AGENT|SMS Site Server' AND ItemType='Component'" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer
+        foreach ($Prop in $ADSystemDiscovery.Props) {
+            #schedule and suches
+            switch ($Prop.PropertyName) {
+                'Enable Incremental Sync' {
+                    If ($Prop.Value -eq 1) {
+                        $ADSDHash.Add('IncrementalSync', 'Enabled')
+                    }
+                    Else {
+                        $ADSDHash.Add('IncrementalSync', 'Disabled')
+                    }
+                }
+                'Startup Schedule' {
+                    $schedule = Convert-CMSchedule $prop.Value1
+                    If ($schedule.MinuteSpan -ne 0) {
+                        $ADSDHash.Add('IncrementalSyncSchedule', $schedule.MinuteSpan)
+                    }
+                }
+                'Full Sync Schedule' {
+                    $SDFullSched = Convert-CMSchedule $prop.Value1
+                    $ADSDHash.Add('FullSyncSchedule', "$(Get-HumanReadableSchedule -Schedule $SDFullSched)")
+                }
+                'SETTINGS' {
+                    If ($Prop.Value1 -eq 'ACTIVE') {
+                        $ADSDHash.Add('DiscoveryState', 'Enabled')
+                    }
+                    Else {
+                        $ADSDHash.Add('DiscoveryState', 'Disabled')
+                    }
+                }
+                'Enable Filtering Expired Logon' {
+                    If ($Prop.Value -eq 1) {
+                        $ADSDHash.Add('FilterExpiredLogon', 'Enabled')
+                    }
+                    Else {
+                        $ADSDHash.Add('FilterExpiredLogon', 'Disabled')
+                    }
+                }
+                'Days Since Last Logon' {
+                    $ADSDHash.Add('FilterExpiredLogonTime', $Prop.Value)
+                }
+                'Enable Filtering Expired Password' {
+                    If ($Prop.Value -eq 1) {
+                        $ADSDHash.Add('FilterExpiredPassword', 'Enabled')
+                    }
+                    Else {
+                        $ADSDHash.Add('FilterExpiredPassword', 'Disabled')
+                    }
+                }
+                'Days Since Last Password Set' {
+                    $ADSDHash.Add('FilterExpiredPasswordTime', $Prop.Value)
+                }
+            }    
+        }
+        $ADContainerDiscovery = @()
+        $AdditionalADAttributes = @()
+        $ADContainerSearchCreds = @()
+        $ADContainerExclusions = @()
+        foreach ($List in $ADSystemDiscovery.PropLists) {
+            #Domains and Groups
+            switch -wildcard ($List.PropertyListName) {
+                'AD Containers' {
+                    $start = 0
+                    foreach ($value in $List.values) {
+                        $start++
+                        switch ($start) {
+                            1 { $one = $value }
+                            2 { 
+                                If ($value -eq 0) {
+                                    $two = 'Yes'
+                                }
+                                else {
+                                    $two = 'No'
+                                }
+                            }
+                            3 {
+                                If ($value -eq 1) {
+                                    $three = 'Excluded'
+                                }
+                                else {
+                                    $three = 'Included'
+                                }
+                                $ADContainerDiscovery += [pscustomobject]@{'Container' = $one; 'Recursive' = $two; 'Groups' = $three; 'Account' = 'Site Server'; 'Exclusions' = 'None' }
+                                Remove-Variable one, two, three
+                                $start = 0
+                            }
+                        }
+                    }
+                }
+                'AD Attributes' {
+                    $AdditionalADAttributes += $List.values
+                }
+                'AD Containers Exclusions' {
+                    $start = 0
+                    foreach ($value in $List.values) {
+                        $start++
+                        switch ($start) {
+                            1 { $one = $value }
+                            2 {
+                                $ADContainerExclusions += [pscustomobject]@{'Container' = $one; 'Exclusions' = $value }
+                                Remove-Variable one
+                                $start = 0
+                            }
+                        }
+                    }
+                }
+                'AD Accounts:*' {
+                    $AccountContainer = $List.PropertyListName -replace 'AD Accounts:', ''
+                    $ADContainerSearchCreds += [pscustomobject]@{'Container' = $AccountContainer; 'Account' = "$($List.Values[0])" }
+                }
+            }
+        }
+        foreach ($account in $ADContainerSearchCreds) {
+            foreach ($Container in $ADContainerDiscovery) {
+                If ($account.Container -like $Container.Container) {
+                    $Container.Account = $account.Account
+                }
+            }
+        }
+        foreach ($Exclusion in $ADContainerExclusions) {
+            foreach ($Container in $ADContainerDiscovery) {
+                If ($Exclusion.Container -like $Container.Container) {
+                    $Container.Exclusions = $Exclusion.Exclusions
+                }
+            }
+        }
+        $ADSDHash.Add('ActiveDirectoryContainers', $ADContainerDiscovery)
+        $ADSDHash.Add('ActiveDirectoryAttributes', $AdditionalADAttributes)
+        [PSCustomObject]$ADSDHash
+    }
+    #endregion AD System Discovery
+
+    #region AD User Discovery
+    If ($dmx -eq 4 -or $DMX -eq 7) {
+        $ADUDHash = @{ }
+        $ADUDHash.Add('DiscoveryMethod', 'Active Directory User Discovery')
+        $ADUserDiscovery = Get-WmiObject -Query "SELECT * FROM SMS_SCI_Component WHERE FileType=2 AND ItemName='SMS_AD_USER_DISCOVERY_AGENT|SMS Site Server' AND ItemType='Component'" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer
+        foreach ($Prop in $ADUserDiscovery.Props) {
+            #schedule and suches
+            switch ($Prop.PropertyName) {
+                'Enable Incremental Sync' {
+                    If ($Prop.Value -eq 1) {
+                        $ADUDHash.Add('IncrementalSync', 'Enabled')
+                    }
+                    Else {
+                        $ADUDHash.Add('IncrementalSync', 'Disabled')
+                    }
+                }
+                'Startup Schedule' {
+                    $schedule = Convert-CMSchedule $prop.Value1
+                    If ($schedule.MinuteSpan -ne 0) {
+                        $ADUDHash.Add('IncrementalSyncSchedule', $schedule.MinuteSpan)
+                    }
+                }
+                'Full Sync Schedule' {
+                    $SDFullSched = Convert-CMSchedule $prop.Value1
+                    $ADUDHash.Add('FullSyncSchedule', "$(Get-HumanReadableSchedule -Schedule $SDFullSched)")
+                }
+                'SETTINGS' {
+                    If ($Prop.Value1 -eq 'ACTIVE') {
+                        $ADUDHash.Add('DiscoveryState', 'Enabled')
+                    }
+                    Else {
+                        $ADUDHash.Add('DiscoveryState', 'Disabled')
+                    }
+                }
+            }    
+        }
+        $ADUserContainerDiscovery = @()
+        $AdditionalADUserAttributes = @()
+        $ADUserSearchCreds = @()
+        $ADUserContainerExclusions = @()
+        foreach ($List in $ADUserDiscovery.PropLists) {
+            #Domains and Groups
+            switch -wildcard ($List.PropertyListName) {
+                'AD Containers' {
+                    $start = 0
+                    foreach ($value in $List.values) {
+                        $start++
+                        switch ($start) {
+                            1 { $one = $value }
+                            2 { 
+                                If ($value -eq 0) {
+                                    $two = 'Yes'
+                                }
+                                else {
+                                    $two = 'No'
+                                }
+                            }
+                            3 {
+                                If ($value -eq 1) {
+                                    $three = 'Excluded'
+                                }
+                                else {
+                                    $three = 'Included'
+                                }
+                                $ADUserContainerDiscovery += [pscustomobject]@{'Container' = $one; 'Recursive' = $two; 'Groups' = $three; 'Account' = 'Site Server'; 'Exclusions' = 'None' }
+                                Remove-Variable one, two, three
+                                $start = 0
+                            }
+                        }
+                    }
+                }
+                'AD Attributes' {
+                    $AdditionalADUserAttributes += $List.values
+                }
+                'AD Containers Exclusions' {
+                    $start = 0
+                    foreach ($value in $List.values) {
+                        $start++
+                        switch ($start) {
+                            1 { $one = $value }
+                            2 {
+                                $ADUserContainerExclusions += [pscustomobject]@{'Container' = $one; 'Exclusions' = $value }
+                                Remove-Variable one
+                                $start = 0
+                            }
+                        }
+                    }
+                }
+                'AD Accounts:*' {
+                    $AccountContainer = $List.PropertyListName -replace 'AD Accounts:', ''
+                    $ADUserSearchCreds += [pscustomobject]@{'Container' = $AccountContainer; 'Account' = "$($List.Values[0])" }
+                }
+            }
+        }
+        foreach ($account in $ADUserSearchCreds) {
+            foreach ($Container in $ADUserContainerDiscovery) {
+                If ($account.Container -like $Container.Container) {
+                    $Container.Account = $account.Account
+                }
+            }
+        }
+        foreach ($Exclusion in $ADUserContainerExclusions) {
+            foreach ($Container in $ADUserContainerDiscovery) {
+                If ($Exclusion.Container -like $Container.Container) {
+                    $Container.Exclusions = $Exclusion.Exclusions
+                }
+            }
+        }
+        $ADUDHash.Add('ActiveDirectoryContainers', $ADUserContainerDiscovery)
+        $ADUDHash.Add('ActiveDirectoryAttributes', $AdditionalADUserAttributes)
+        [PSCustomObject]$ADUDHash
+    }
+    #endregion User Discovery
+}
+
+Function Get-PWCMPhasedDeployment {
+    <#
+    .SYNOPSIS
+    Gets the Details of a phased deployment.
+    
+    .DESCRIPTION
+    Gets the Details of a phased deployment in CM.  If no deployment specified, all are found and returned.
+    
+    .PARAMETER Name
+    Finds the phased deployment by its Name.
+    
+    .PARAMETER PhasedDeploymentID
+    Finds the phased deployment by its deployment ID, GUID.
+    
+    .PARAMETER DeploymentObjectID
+    Finds the phased deployment by the object that this deployment is targeting (Application, Task Sequence, or Update Group).
+    
+    .PARAMETER SiteServer
+    The primary site server (Where the WMI queries will be directed).
+    
+    .PARAMETER SiteName
+    Your SCCM Site code (MMS).
+    
+    .EXAMPLE
+    Get-PWCMPhasedDeployment -Name '7-Zip structured Deployment'
+
+    .EXAMPLE
+    Get-PWCMPhasedDeployment -PhasedDeploymentID 'FD114F32-752F-4DA9-AB2A-1B388B0E5807'
+    
+    .EXAMPLE
+    Get-PWCMPhasedDeployment -DeploymentObjectID MMS0000213
+
+    .NOTES
+    General notes
+    #>
+    
+    [CmdletBinding(DefaultParameterSetName = 'ByName')]
+    param(
+        [Parameter(Mandatory = $false, ParameterSetName='ByName')]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+        [Parameter(Mandatory = $false, ParameterSetName='ByDeploymentID')]
+        [ValidateNotNullOrEmpty()]
+        [string]$PhasedDeploymentID,
+        [Parameter(Mandatory = $false, ParameterSetName='ByObjectId')]
+        [ValidateNotNullOrEmpty()]
+        [string]$DeploymentObjectID,
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SiteServer = $env:COMPUTERNAME,
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SiteName = (Get-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\CCM\CcmEval -Name LastSiteCode -ErrorAction SilentlyContinue).LastSiteCode
+    )
+    If ($Name){
+        $PDs = Get-WmiObject -Query "SELECT * FROM SMS_PhasedDeployment where Name Like '$Name'" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer
+    }
+    elseIf ($PhasedDeploymentID){
+        $PDs = Get-WmiObject -Query "SELECT * FROM SMS_PhasedDeployment where PhasedDeploymentID Like '$PhasedDeploymentID'" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer
+    }
+    elseIf ($DeploymentObjectID){
+        Write-Verbose "Get-WmiObject -Query `"SELECT * FROM SMS_PhasedDeployment where DeploymentObjectID Like `'$DeploymentObjectID`'`" -Namespace ROOT\SMS\site_$SiteName -ComputerName $SiteServer"
+        $PDs = Get-WmiObject -Query "SELECT * FROM SMS_PhasedDeployment where DeploymentObjectID Like '$DeploymentObjectID'" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer
+    } else {
+        $PDs = Get-WmiObject -Query "SELECT * FROM SMS_PhasedDeployment" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer
+    }
+    foreach ($PD in $PDs){
+        $PD.Get()
+        switch ($PD.DeploymentObjectType) {
+            0 {
+                $Type = 'Task Sequence'
+                $DeploymentObjectName = (Get-WmiObject -Query "SELECT * FROM SMS_TaskSequencePackage WHERE PackageID='$($PD.DeploymentObjectID)'" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer).Name
+            }
+            1 {
+                $Type = 'Software Update'
+                $DeploymentObjectName = (Get-WmiObject -Query "SELECT * FROM SMS_AuthorizationList WHERE CI_ID=$($PD.DeploymentObjectID)" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer).LocalizedDisplayName
+            }
+            2 {
+                $Type = 'Application'
+                $DeploymentObjectName = (Get-WmiObject -Query "SELECT * FROM SMS_ApplicationLatest WHERE CI_ID=$($PD.DeploymentObjectID)" -Namespace "ROOT\SMS\site_$SiteName" -ComputerName $SiteServer).LocalizedDisplayName
+            }
+            Default { $Type = 'Unknown' }
+        }
+        $PD | Select-Object @{Name = "SmsProviderObjectPath"; Expression = {$_.__RELPATH}},Action,DeploymentObjectID,@{Name = "DeploymentObjectName"; Expression = {$DeploymentObjectName}},@{Name = "DeploymentObjectTypeName"; Expression = {$Type}},DeploymentObjectType,Description,EvaluatePhasedDeployment,@{Name = "LastEvaluateTime"; Expression = {$(Convert-UTCtoLocal($_.LastEvaluateTime))}},@{Name = "LastModifiedTime"; Expression = {$(Convert-UTCtoLocal($_.LastModifiedTime))}},Name,PhasedDeploymentDigest,PhasedDeploymentID,Version
+    }
+}
+
+Function Get-PWCMPDPhases {
+    <#
+    .SYNOPSIS
+    Gets the details on all the defined phases of a phased deployment.
+    
+    .DESCRIPTION
+    Gets the details on all the defined phases of a phased deployment.  Depending on the type, there are different details available.
+    
+    .PARAMETER Name
+    Finds the phased deployment by its Name.
+    
+    .PARAMETER PhasedDeploymentID
+    Finds the phased deployment by its deployment ID, GUID.
+    
+    .PARAMETER DeploymentObjectID
+    Finds the phased deployment by the object that this deployment is targeting (Application, Task Sequence, or Update Group).
+    
+    .PARAMETER SiteServer
+    The primary site server (Where the WMI queries will be directed).
+    
+    .PARAMETER SiteName
+    Your SCCM Site code (MMS).
+    
+    .EXAMPLE
+    Get-PWCMPDPhases -Name '7-Zip structured Deployment'
+
+    .EXAMPLE
+    Get-PWCMPDPhases -PhasedDeploymentID 'FD114F32-752F-4DA9-AB2A-1B388B0E5807'
+    
+    .EXAMPLE
+    Get-PWCMPDPhases -DeploymentObjectID MMS0000213
+
+    #>
+    
+    [CmdletBinding(DefaultParameterSetName = 'ByName')]
+    param(
+        [Parameter(Mandatory = $true, ParameterSetName='ByName')]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+        [Parameter(Mandatory = $true, ParameterSetName='ByDeploymentID')]
+        [ValidateNotNullOrEmpty()]
+        [string]$PhasedDeploymentID,
+        [Parameter(Mandatory = $true, ParameterSetName='ByObjectId')]
+        [ValidateNotNullOrEmpty()]
+        [string]$DeploymentObjectID,
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SiteServer = $env:COMPUTERNAME,
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SiteName = (Get-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\CCM\CcmEval -Name LastSiteCode -ErrorAction SilentlyContinue).LastSiteCode
+    )
+    If ($Name) {
+        Try{
+            $PhasedDeployment = Get-PWCMPhasedDeployment -Name $Name -SiteServer $SiteServer -SiteName $SiteName
+            $phases = [XML]$PhasedDeployment.PhasedDeploymentDigest
+            $DeploymentType = $PhasedDeployment.DeploymentObjectTypeName
+        }
+        Catch{
+            Throw "Error : Could not find phased deployment by name: $Name"
+        }
+        if ([string]::IsNullOrEmpty($DeploymentType)) {
+            Throw "Could not find phased deployment by name: $Name"
+        }
+    }
+    If ($PhasedDeploymentID) {
+        Try{
+            $PhasedDeployment = Get-PWCMPhasedDeployment -PhasedDeploymentID $PhasedDeploymentID -SiteServer $SiteServer -SiteName $SiteName
+            $phases = [XML]$PhasedDeployment.PhasedDeploymentDigest
+            $DeploymentType = $PhasedDeployment.DeploymentObjectTypeName
+        }
+        Catch{
+            Throw "Error : Could not find phased deployment by PhasedDeploymentID: $PhasedDeploymentID"
+        }
+        if ([string]::IsNullOrEmpty($DeploymentType)) {
+            Throw "Could not find phased deployment by PhasedDeploymentID: $PhasedDeploymentID"
+        }
+    }
+    If ($DeploymentObjectID) {
+        try{
+            $PhasedDeployment = Get-PWCMPhasedDeployment -DeploymentObjectID $DeploymentObjectID -SiteServer $SiteServer -SiteName $SiteName
+            $phases = [XML]$PhasedDeployment.PhasedDeploymentDigest
+            $DeploymentType = $PhasedDeployment.DeploymentObjectTypeName    
+        }
+        catch{
+            Throw "Error : Could not find phased deployment by DeploymentObjectID: $DeploymentObjectID"
+        }
+        if ([string]::IsNullOrEmpty($DeploymentType)) {
+            Throw "Could not find phased deployment by DeploymentObjectID: $DeploymentObjectID"
+        }
+    }
+    Foreach ($Phase in $phases.PhasedDeployment.Phases.phase){
+        IF ($Phase.SuccessCriterias.Criteria){
+            $ht += @{'SuccessCriteria' = [pscustomobject](@{"$($Phase.SuccessCriterias.Criteria.CriteriaType)" = "$($Phase.SuccessCriterias.Criteria.CriteriaValue)"})}
+        }
+        If ($Phase.Targets.CollectionID){
+            $ht += @{'Target' = "$($Phase.Targets.CollectionID)"}
+        }
+        IF ($Phase.PhaseId){
+            $ht += @{'Name' = "$($Phase.PhaseId)"}
+        }
+        IF ($Phase.Order){
+            $ht += @{'Order' = "$($Phase.Order)"}
+        }
+        If ($Phase.Condition.DaysAfterPrevPhaseSuccess){
+            If ($Phase.Condition.DaysAfterPrevPhaseSuccess -ne -1){
+                $ht += @{'DaysAfterPrevPhaseSuccess' = "$($Phase.Condition.DaysAfterPrevPhaseSuccess)"}
+                $ht += @{'ManuallyStartPhase' = $false}
+            } else {
+                $ht += @{'DaysAfterPrevPhaseSuccess' = ''}
+                $ht += @{'ManuallyStartPhase' = $true}
+            }
+        }
+        If ($Phase.ThrottlingDays){
+            $ht += @{'GraduallyAvailable' = "$($Phase.ThrottlingDays)"}
+        }
+        If ($Phase.Deployment){
+            switch ($DeploymentType) {
+                'Task Sequence' {
+                    #Task sequence phased deployments do not have easy to use XML. So, let's pipe the configurable settings into a custom object.
+                    $DeploymentXML = ([xml]$($Phase.Deployment.OuterXML)).Deployment
+                    $Deploy += @{'DeadlineDelta' = "$($DeploymentXML.DeadlineDelta)"}
+                    $Deploy += @{'DeadlineUnit' = "$($DeploymentXML.DeadlineUnit)"}
+                    If ($DeploymentXML.OfferFlags -band 0x100000){
+                        $Deploy += @{'MaintenanceWindowInstallOverride' = $true}
+                    } else {
+                        $Deploy += @{'MaintenanceWindowInstallOverride' = $false}
+                    }
+                    If ($DeploymentXML.OfferFlags -band 0x200000){
+                        $Deploy += @{'MaintenanceWindowRestartOverride' = $true}
+                    } else {
+                        $Deploy += @{'MaintenanceWindowRestartOverride' = $false}
+                    }
+                    If ($DeploymentXML.OfferFlags -band 0x1000){
+                        $Deploy += @{'PreDownloadContent' = $true}
+                    } else {
+                        $Deploy += @{'PreDownloadContent' = $false}
+                    }
+                    If ($DeploymentXML.OfferFlags -band 0x800000){
+                        $Deploy += @{'UserExperience' = 'ShowAll'}
+                    } else {
+                        $Deploy += @{'UserExperience' = 'HideAll'}
+                    }
+                    If ($DeploymentXML.OfferFlags -band 0x20000){
+                        $Deploy += @{'UseSiteDefaultDP' = $true}
+                    } else {
+                        $Deploy += @{'UseSiteDefaultDP' = $false}
+                    }
+                    If ($DeploymentXML.RemoteClientFlags -band 0x0100){
+                        $Deploy += @{'UseNeighborDP' = $false}
+                    } else {
+                        $Deploy += @{'UseNeighborDP' = $true}
+                    }
+                    If ($DeploymentXML.RemoteClientFlags -band 0x0020){
+                        $Deploy += @{'RemoteDeployOpt' = 'DownloadWhenNeeded'}
+                    } else {
+                        $Deploy += @{'RemoteDeployOpt' = 'DownloadBefore'}
+                    }
+                    If ($DeploymentXML.RemoteClientFlags -band 0x8000){
+                        $Deploy += @{'WECommitAtDeadline' = $true}
+                    } else {
+                        $Deploy += @{'WECommitAtDeadline' = $false}
+                    }
+                    $ObjPD = [pscustomobject]$Deploy
+                    $ht += @{'DeploymentXML' = $DeploymentXML}
+                    $ht += @{'Deployment' = $ObjPD}
+                    Remove-Variable Deploy
+                    Remove-Variable ObjPD        
+                }
+                'Software Update' {
+                    #Software updates phased deployments already have the data with them in XML.  So, just pass the xml.
+                    $DeploymentXML = ([xml]$($Phase.Deployment.OuterXML)).Deployment
+                    $ht += @{'DeploymentXML' = $DeploymentXML}
+                    $ht += @{'Deployment' =  $DeploymentXML}
+                }
+                Default {}
+            }
+        }
+        [pscustomobject]$ht
+        Remove-Variable ht
+    }
+}
+
+Function Write-ProgressEx {
+    [CmdletBinding()]
+    param(
+        [string]$Activity = $Progress.Activity,
+        [string]$Status = $Progress.Status,
+        [int]$Id = 0,
+        [string]$CurrentOperation = '...',
+        [switch]$Completed,
+        [switch]$NoDisplay,
+        [switch]$NoLog
+    )
+    $RunTimeFormatted = "[$(Get-Date -Format 'yyyy/MM/dd HH:mm:ss') -- Running for $("{0:HH:mm:ss}" -f ([datetime]$($(get-date) - $ScriptStartTime).Ticks))]"
+    Write-Verbose -Message "$RunTimeFormatted $($Progress.Status) :: $CurrentOperation"
+    $Progress = @{
+        Activity = "$Activity"
+        Status = "$Status"
+        Id = $Id
+        CurrentOperation = "$RunTimeFormatted $CurrentOperation"
+        Completed = $Completed
+    }
+    If ($NoDisplay -eq $false) { Write-Progress @Progress }
+    #TODO: If ($NoDisplay -eq $false) { Write-CMTraceLog -Message "$($Progress.Status) :: $CurrentOperation"
+}
+
 #endregion Additional Functions
 
 ####################################################################################################################################################################
@@ -1138,39 +2194,44 @@ Function Set-AccountMask{
 #####################################################################Starting#######################################################################################
 ####################################################################################################################################################################
 ####################################################################################################################################################################
+$Progress = @{'Activity'="$Title started $($ScriptStartTime.ToShortTimeString())"; 'Status'='Initializing'}
+Write-ProgressEx
+
 $StartingPath = (get-location).Path
 if ($FilePath -notlike "$PSScriptRoot\CMDocumentation.html"){
     if ([System.IO.Path]::IsPathRooted("$FilePath")){
-        Write-Verbose "$(Get-Date):   File path is $FilePath"
     }else{
         $FilePath = "$($StartingPath)\$($FilePath.TrimStart('.\'))"
-        Write-Verbose "$(Get-Date):   File path is $FilePath"
     }
+    Write-ProgressEx -CurrentOperation "File path is $FilePath"
 }
 if ($AddDateTime){
     $dirName = [io.path]::GetDirectoryName($FilePath)
     $filename = [io.path]::GetFileNameWithoutExtension($FilePath)
     $ext = [io.path]::GetExtension($FilePath)
-    $FilePath = "$dirName\$($filename)_$(get-date -f yyyyMMddThhmmss)$ext"
+    $FilePath = "$dirName\$($filename)_$(get-date -f yyyyMMddTHHmmss)$ext"
 }
-write-host "Outputting documentation to: $FilePath"
+Write-host "Outputting documentation to: $FilePath"
 
-$SiteCode = Get-SiteCode
+Write-ProgressEx -CurrentOperation 'Start writing report data'
 
-Write-Verbose "$(Get-Date): Start writing report data"
-
-$LocationBeforeExecution = Get-Location
-
-Write-HTMLHeader -Title $Title -File $FilePath
+If ($StyleSheet){
+    Write-ProgressEx -CurrentOperation 'Applying Custom style sheet'
+    Write-HTMLHeader -Title $Title -File $FilePath -CssStyleFile $StyleSheet
+}else{
+    Write-HTMLHeader -Title $Title -File $FilePath
+}
+Write-ProgressEx -CurrentOperation 'Writing cover page'
 Write-HTMLCoverPage -Title $Title -Author $Author -Vendor $Vendor -Org $CompanyName -ImagePath $CompanyLogo -File $FilePath
 Add-Type -AssemblyName System.Web
 
+$SiteCode = Get-SiteCode
 
 #Import the CM Powershell cmdlets
 if (-not (Test-Path -Path $SiteCode))
 {
-  Write-Verbose "$(Get-Date):   CM PowerShell module has not been imported yet, will import it now."
-  Import-Module ($env:SMS_ADMIN_UI_PATH.Substring(0,$env:SMS_ADMIN_UI_PATH.Length - 5) + '\ConfigurationManager.psd1') | Out-Null
+    Write-ProgressEx -CurrentOperation 'CM PowerShell module has not been imported yet, will import it now.'
+    Import-Module ($env:SMS_ADMIN_UI_PATH.Substring(0,$env:SMS_ADMIN_UI_PATH.Length - 5) + '\ConfigurationManager.psd1') | Out-Null
 }
 #CM12 cmdlets need to be run from the CM12 drive
 Set-Location "$($SiteCode):" | Out-Null
@@ -1182,11 +2243,12 @@ if (-not (Get-PSDrive -Name $SiteCode))
 
 #### Administration
 #### Site Configuration
+$Progress = @{'Activity'="$Title started $($ScriptStartTime.ToShortTimeString())"; 'Status'='Configuration Summary'}
 
 Write-HTMLHeading -Text 'Table of Contents' -Level 1 -PageBreak -ExcludeTOC -File $FilePath
 Write-HtmlComment -Text "TOC_Insert_Point" -File $FilePath
 Write-HTMLHeading -Text 'Summary of all Sites in this Hierarchy' -Level 1 -PageBreak -File $FilePath
-Write-Verbose "$(Get-Date):   Getting Site Information"
+Write-ProgressEx -CurrentOperation 'Getting Sites Information'
 $CMSites = Get-CMSite
 
 $CAS                    = $CMSites | Where-Object {$_.Type -eq 4}
@@ -1195,6 +2257,7 @@ $StandAlonePrimarySite  = $CMSites | Where-Object {$_.Type -eq 2}
 $SecondarySites         = $CMSites | Where-Object {$_.Type -eq 1}
 
 #region CAS
+Write-ProgressEx -CurrentOperation 'Checking CAS'
 if (-not [string]::IsNullOrEmpty($CAS))
 {
   Write-HTMLParagraph -Text 'The following Central Administration Site is installed:' -level 1 -File $FilePath
@@ -1209,7 +2272,7 @@ else {
 
 #region Child Primary Sites
 if (-not [string]::IsNullOrEmpty($ChildPrimarySites)){
-    Write-Verbose "$(Get-Date):   Enumerating all child Primary Site."
+    Write-ProgressEx -CurrentOperation "Enumerating all child Primary Site."
     Write-HTMLParagraph -Text 'The following child Primary Sites are installed:' -level 1 -File $FilePath
     $ChildSites = @()
     foreach ($ChildSite in $ChildPrimarySites){
@@ -1221,22 +2284,20 @@ if (-not [string]::IsNullOrEmpty($ChildPrimarySites)){
 
 
 #region Standalone Primary
-if (-not [string]::IsNullOrEmpty($StandAlonePrimarySite))
-{
-  Write-Verbose "$(Get-Date):   Enumerating a standalone Primary Site."
-  Write-HTMLParagraph -Text 'The following Primary Site is installed:' -level 1 -File $FilePath
-  $CMSiteID = Get-WmiObject -Class SMS_Identification -Namespace root\sms\site_$SiteCode -ComputerName $SMSProvider| where {$_.ThisSiteCode -eq "$SiteCode"}
-  $ReleaseVersion = $CMSiteID.MonthlyReleaseVersion
-  $StandAlonePrimarySite = New-Object -TypeName psobject -Property @{'Site Name' = $StandAlonePrimarySite.SiteName; 'Site Code' = $StandAlonePrimarySite.SiteCode; Version = $StandAlonePrimarySite.Version; 'Build' = $StandAlonePrimarySite.BuildNumber; 'Release Version' = $ReleaseVersion};
-  
-  $StandAlonePrimarySite = $StandAlonePrimarySite |select 'Site Name','Site Code','Release Version',Version,Build
-  Write-HtmlTable -InputObject $StandAlonePrimarySite -Border 1 -Level 1 -File $FilePath
+if (-not [string]::IsNullOrEmpty($StandAlonePrimarySite)) {
+    Write-ProgressEx -CurrentOperation "Enumerating a standalone Primary Site."
+    Write-HTMLParagraph -Text 'The following Primary Site is installed:' -level 1 -File $FilePath
+    $CMSiteID = Get-WmiObject -Class SMS_Identification -Namespace root\sms\site_$SiteCode -ComputerName $SMSProvider| where-object {$_.ThisSiteCode -eq "$SiteCode"}
+    $ReleaseVersion = $CMSiteID.MonthlyReleaseVersion
+    $StandAlonePrimarySite = New-Object -TypeName psobject -Property @{'Site Name' = $StandAlonePrimarySite.SiteName; 'Site Code' = $StandAlonePrimarySite.SiteCode; Version = $StandAlonePrimarySite.Version; 'Build' = $StandAlonePrimarySite.BuildNumber; 'Release Version' = $ReleaseVersion};
+    $StandAlonePrimarySite = $StandAlonePrimarySite |Select-Object 'Site Name','Site Code','Release Version',Version,Build
+    Write-HtmlTable -InputObject $StandAlonePrimarySite -Border 1 -Level 1 -File $FilePath
 }
 #endregion Standalone Primary
 
 #region Secondary Sites
+Write-ProgressEx -CurrentOperation "Enumerating all secondary sites."
 if (-not [string]::IsNullOrEmpty($SecondarySites)){
-    Write-Verbose "$(Get-Date):   Enumerating all secondary sites."
     Write-HTMLParagraph -Text 'The following Secondary Sites are installed:' -level 1 -File $FilePath
     $SecSites = @()
     foreach ($SecondarySite in $SecondarySites){
@@ -1250,15 +2311,15 @@ if (-not [string]::IsNullOrEmpty($SecondarySites)){
 #region Site Configuration report
 foreach ($CMSite in $CMSites)
 {  
-  Write-Verbose "$(Get-Date):   Checking each site's configuration."
+  Write-ProgressEx -CurrentOperation "Checking each site's configuration"
   Write-HTMLHeading -Text "Configuration Summary for Site $($CMSite.SiteCode)" -level 1 -File $FilePath
   Write-HTMLHeading -Text "Updates and Servicing" -Level 2 -File $FilePath
 
   #region Site Servicing Updates
-  Write-Verbose "$(Get-Date):   Enumerating Configuration Manager Update Status and History"
+  Write-ProgressEx -CurrentOperation "Enumerating Configuration Manager Update Status and History"
   Write-HTMLHeading -Text "Update Status and History" -Level 3 -File $FilePath
   Write-HTMLParagraph -Text "Below is a history of updates that have been made available to this Site.  It includes information for if, or when, they were installed.  Some older updates may be listed as ready to install, however, they were never installed nor will they be avialable to install as they are superseded by the newer updates." -Level 3 -File $FilePath
-  $SiteUpdateHistory = Get-CMSiteUpdateHistory| select Name,FullVersion,Impact,State,UpdateType,LastUpdateTime|sort LastUpdateTime
+  $SiteUpdateHistory = Get-CMSiteUpdateHistory| Select-Object Name,FullVersion,Impact,State,UpdateType,LastUpdateTime|Sort-Object LastUpdateTime
   if(-not [string]::IsNullOrEmpty($SiteUpdateHistory)){
     $SiteUpdates = @()
     foreach ($SiteUpdate in $SiteUpdateHistory){
@@ -1274,18 +2335,18 @@ foreach ($CMSite in $CMSites)
         }
         $SiteUpdates += New-Object -TypeName PSObject -Property @{'Name'="$($SiteUpdate.Name)";'Version'="$($SiteUpdate.FullVersion)";'Status'="$UpdateState";'Installed Date'="$InstalledDate"}
     }
-    $SiteUpdates = $SiteUpdates | select 'Name','Version','Status','Installed Date'
+    $SiteUpdates = $SiteUpdates | Select-Object 'Name','Version','Status','Installed Date'
     Write-HtmlTable -InputObject $SiteUpdates -Border 1 -Level 3 -File $FilePath
   }
-  Write-Verbose "$(Get-Date):   Completed Configuration Manager Update Status and History"
+  Write-ProgressEx -CurrentOperation "Completed Configuration Manager Update Status and History"
   #endregion Site Servicing Updates
 
   #region Site Features
-  Write-Verbose "$(Get-Date):   Enumerating Configuration Manager Site Features"
+  Write-ProgressEx -CurrentOperation "Enumerating Configuration Manager Site Features"
   Write-HTMLHeading -Text "Site Features" -Level 3 -File $FilePath
   $features=Get-CMSiteFeature
   #region release features
-  $ReleaseFeatures = $features | Where{$_.FeatureType -eq 1}|Sort-Object Name
+  $ReleaseFeatures = $features | Where-Object {$_.FeatureType -eq 1}|Sort-Object Name
   $FeatureTable = @()
   Foreach ($feature in $ReleaseFeatures){
     $FeatureName = $feature.Name
@@ -1302,7 +2363,8 @@ foreach ($CMSite in $CMSites)
   #endregion release features
 
   #region PreReleaseFeatures
-  $PreReleaseFeatures = $features | Where{$_.FeatureType -eq 0}|Sort-Object Name
+  Write-ProgressEx -CurrentOperation "Enumerating Configuration Manager Site Pre-Release Features"
+  $PreReleaseFeatures = $features | Where-Object {$_.FeatureType -eq 0}|Sort-Object Name
   $PreFeatureTable = @()
   Foreach ($feature in $PreReleaseFeatures){
     $FeatureName = $feature.Name
@@ -1317,11 +2379,13 @@ foreach ($CMSite in $CMSites)
   Write-HTMLParagraph -Text "Below is a list of all pre-release features in this Configuration Manager site and which ones are enabled and which are not.  Once a feature is turned on, it cannot be turned off." -Level 4 -File $FilePath
   Write-HtmlTable -InputObject $PreFeatureTable -Border 1 -Level 4 -File $FilePath
   #endregion PreReleaseFeatures
+
   Write-HtmliLink -ReturnTOC -File $FilePath
-  Write-Verbose "$(Get-Date):   Completed Configuration Manager Site Features"
+  Write-ProgressEx -CurrentOperation "Completed Configuration Manager Site Features"
   #endregion Site Features
 
   #region SiteRoles
+Write-ProgressEx -CurrentOperation "Site Roles"
 If ($ListAllInformation){
   $SiteRolesTable = @()  
   $SiteRoles = Get-CMSiteRole -SiteCode $CMSite.SiteCode
@@ -1347,34 +2411,34 @@ If ($ListAllInformation){
         'SMS Site System' {
             $RoleName = "Site system"
             $RoleSettings += @("--B--General--/B--")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "Server Remote Public Name" }).Value1 -ne "") {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "Server Remote Public Name" }).Value1 -ne "") {
                 $RoleSettings += @("- Specify FQDN for use on the Internet - CHECKED")
-                $RoleSettings += @("--TAB--Internet FQDN: $(($SiteRole.Props | ? { $_.PropertyName -eq "Server Remote Public Name" }).Value1)")
+                $RoleSettings += @("--TAB--Internet FQDN: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "Server Remote Public Name" }).Value1)")
             }
             Else {
                 $RoleSettings += @("- Specify FQDN for use on the Internet - UNCHECKED")
             }
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "FDMOperation" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "FDMOperation" }).Value -eq 1) {
                 $RoleSettings += @("- Require the site server to initiate connections - CHECKED")
             }
             Else {
                 $RoleSettings += @("- Require the site server to initiate connections - UNCHECKED")
             }
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "UseMachineAccount" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "UseMachineAccount" }).Value -eq 1) {
                 $RoleSettings += @("- Installation account: Site server's computer")
             }
             Else {
-                $RoleSettings += @("- Installation account: $(($SiteRole.Props | ? { $_.PropertyName -eq "UserName" }).Value2)")
+                $RoleSettings += @("- Installation account: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "UserName" }).Value2)")
             }
-            $RoleSettings += @("- Active Directory forest: $(($SiteRole.Props | ? { $_.PropertyName -eq "ForestFQDN" }).Value1)")
-            $RoleSettings += @("- Active Directory domain: $(($SiteRole.Props | ? { $_.PropertyName -eq "DomainFQDN" }).Value1)")
+            $RoleSettings += @("- Active Directory forest: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ForestFQDN" }).Value1)")
+            $RoleSettings += @("- Active Directory domain: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "DomainFQDN" }).Value1)")
             $RoleSettings += @("--B--Proxy--/B--")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "UseProxy" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "UseProxy" }).Value -eq 1) {
                 $RoleSettings += @("- Proxy: Configured")
-                $RoleSettings += @("--TAB--Proxy server name: $(($SiteRole.Props | ? { $_.PropertyName -eq "ProxyName" }).Value2)")
-                $RoleSettings += @("--TAB--Port: $(($SiteRole.Props | ? { $_.PropertyName -eq "ProxyServerPort" }).Value)")
-                If (($SiteRole.Props | ? { $_.PropertyName -eq "ProxyUserName" }).Value2 -ne "") {
-                    $RoleSettings += @("--TAB--Proxy account: $(($SiteRole.Props | ? { $_.PropertyName -eq "ProxyUserName" }).Value2)")
+                $RoleSettings += @("--TAB--Proxy server name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ProxyName" }).Value2)")
+                $RoleSettings += @("--TAB--Port: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ProxyServerPort" }).Value)")
+                If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "ProxyUserName" }).Value2 -ne "") {
+                    $RoleSettings += @("--TAB--Proxy account: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ProxyUserName" }).Value2)")
                 }
                 Else {
                     $RoleSettings += @("--TAB--Proxy account: No account configured")
@@ -1389,16 +2453,16 @@ If ($ListAllInformation){
         'SMS Distribution Point' {
             $RoleName = "Distribution point"
             $RoleSettings += @("--B--General--/B--")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "UpdateBranchCacheKey" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "UpdateBranchCacheKey" }).Value -eq 1) {
                 $RoleSettings += @("- BranchCache: Enabled")
             }
             Else {
                 $RoleSettings += @("- BranchCache: Disabled")
             }
-            $RoleSettings += @("- Description: $(($SiteRole.Props | ? { $_.PropertyName -eq "Description" }).Value1)")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "SslState" }).Value -eq 63) {
+            $RoleSettings += @("- Description: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "Description" }).Value1)")
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "SslState" }).Value -eq 63) {
                 $RoleSettings += @("- Communication: HTTPS")
-                If (($SiteRole.Props | ? { $_.PropertyName -eq "TokenAuthEnabled" }).Value -eq 1) {
+                If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "TokenAuthEnabled" }).Value -eq 1) {
                     $RoleSettings += @("--TAB--Allow mobile devices to connect - CHECKED")
                 }
                 Else {
@@ -1407,92 +2471,92 @@ If ($ListAllInformation){
             }
             Else {
                 $RoleSettings += @("- Communication: HTTP")
-                If (($SiteRole.Props | ? { $_.PropertyName -eq "IsAnonymousEnabled" }).Value -eq 1) {
+                If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "IsAnonymousEnabled" }).Value -eq 1) {
                     $RoleSettings += @("--TAB--Allow clients to connect anonymously - CHECKED")
                 }
                 Else {
                     $RoleSettings += @("--TAB--Allow clients to connect anonymously - UNCHECKED")
                 }
             }
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "CertificateFile" }).Value1 -eq "") {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "CertificateFile" }).Value1 -eq "") {
                 $RoleSettings += @("- Certificate: Self-signed")
             }
             Else {
                 $RoleSettings += @("- Certificate: Imported")
             }
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "PreStagingAllowed" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "PreStagingAllowed" }).Value -eq 1) {
                 $RoleSettings += @("- Enable for prestaged content - CHECKED")
             }
             Else {
                 $RoleSettings += @("- Enable for prestaged content - UNCHECKED")
             }
             $RoleSettings += @("--B--PXE--/B--")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "IsPXE" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "IsPXE" }).Value -eq 1) {
                 $RoleSettings += @("- PXE support: Enabled")
-                If (($SiteRole.Props | ? { $_.PropertyName -eq "IsActive" }).Value -eq 1) {
+                If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "IsActive" }).Value -eq 1) {
                     $RoleSettings += @("--TAB--Allow to respond to incoming PXE requests - CHECKED")
                 }
                 Else {
                     $RoleSettings += @("--TAB--Allow to respond to incoming PXE requests - UNCHECKED")
                 }
-                If (($SiteRole.Props | ? { $_.PropertyName -eq "SupportUnknownMachines" }).Value -eq 1) {
+                If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "SupportUnknownMachines" }).Value -eq 1) {
                     $RoleSettings += @("--TAB--Enable unknow computer support - CHECKED")
                 }
                 Else {
                     $RoleSettings += @("--TAB--Enable unknow computer support - UNCHECKED")
                 }
-                If (($SiteRole.Props | ? { $_.PropertyName -eq "PXEPassword" }).Value1 -ne "") {
+                If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "PXEPassword" }).Value1 -ne "") {
                     $RoleSettings += @("--TAB--Require a password when computers use PXE - CHECKED")
                 }
                 Else {
                     $RoleSettings += @("--TAB--Require a password when computers use PXE - UNCHECKED")
                 }
-                Switch (($SiteRole.Props | ? { $_.PropertyName -eq "UdaSetting" }).Value) {
+                Switch (($SiteRole.Props | Where-Object { $_.PropertyName -eq "UdaSetting" }).Value) {
                     0 {$RoleSettings += @("- User device affinity: Do not use user device affinity")}
                     1 {$RoleSettings += @("- User device affinity: Allow user device affinity with manual approval")}
                     2 {$RoleSettings += @("- User device affinity: Allow user device affinity woth automatic approval")}
                 }
-                If (($SiteRole.Props | ? { $_.PropertyName -eq "BindPolicy" }).Value -eq 0) {
+                If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "BindPolicy" }).Value -eq 0) {
                     $RoleSettings += @("- Respond to PXE requests on all network interfaces - CHECKED")
                 }
                 Else {
                     $RoleSettings += @("- Respond to PXE requests on specific network interfaces - CHECKED")
                 }
-                $RoleSettings += @("- PXE response delay (seconds): $(($SiteRole.Props | ? { $_.PropertyName -eq "ResponseDelay" }).Value)")
+                $RoleSettings += @("- PXE response delay (seconds): $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ResponseDelay" }).Value)")
             }
             Else {
                 $RoleSettings += @("- PXE support: Disabled")
             }
             $RoleSettings += @("--B--Multicast--/B--")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "IsMulticast" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "IsMulticast" }).Value -eq 1) {
                 $RoleSettings += @("- Multicast support: Enabled")
                 $MCSettings = (Get-CMMulticastServicePoint -SiteSystemServerName ($SiteRole.NALPath).ToString().Split('\\')[2]).Props
-                If ($MCSettings -eq $Null) {
+                If ($Null -eq $MCSettings) {
                     $RoleSettings += @("--TAB--Multicast configuration unavailable")
                 }
                 Else {
-                    If (($MCSettings | ? { $_.PropertyName -eq "AuthType" }).Value -eq 1) {
-                        $RoleSettings += @("- Multicast connection account: $(($MCSettings | ? { $_.PropertyName -eq "UserName" }).Value1)")
+                    If (($MCSettings | Where-Object { $_.PropertyName -eq "AuthType" }).Value -eq 1) {
+                        $RoleSettings += @("- Multicast connection account: $(($MCSettings | Where-Object { $_.PropertyName -eq "UserName" }).Value1)")
                     }
                     Else {
                         $RoleSettings += @("- Multicast connection account: DP's computer account")
                     }
-                    If (($MCSettings | ? { $_.PropertyName -eq "IpAddressSource" }).Value -eq 1) {
+                    If (($MCSettings | Where-Object { $_.PropertyName -eq "IpAddressSource" }).Value -eq 1) {
                         $RoleSettings += @("- Multicast address settings: Use IPv4 addresses within any range - CHECKED")
                     }
                     Else {
                         $RoleSettings += @("- Multicast address settings: Use IPv4 addresses from the following range - CHECKED")
-                        $RoleSettings += @("--TAB--Address start range: $(($MCSettings | ? { $_.PropertyName -eq "StartIpAddress" }).Value1)")
-                        $RoleSettings += @("--TAB--Address end range: $(($MCSettings | ? { $_.PropertyName -eq "EndIpAddress" }).Value1)")
+                        $RoleSettings += @("--TAB--Address start range: $(($MCSettings | Where-Object { $_.PropertyName -eq "StartIpAddress" }).Value1)")
+                        $RoleSettings += @("--TAB--Address end range: $(($MCSettings | Where-Object { $_.PropertyName -eq "EndIpAddress" }).Value1)")
                     }
                     $RoleSettings += @("- UDP settings:")
-                    $RoleSettings += @("--TAB--Port range start: $(($MCSettings | ? { $_.PropertyName -eq "StartPort" }).Value)")
-                    $RoleSettings += @("--TAB--Port range end: $(($MCSettings | ? { $_.PropertyName -eq "EndPort" }).Value)")
-                    $RoleSettings += @("- Maximum clients: $(($MCSettings | ? { $_.PropertyName -eq "Multicast Max Clients" }).Value)")
-                    If (($MCSettings | ? { $_.PropertyName -eq "Multicast Session Schedule Cast" }).Value -eq 1) {
+                    $RoleSettings += @("--TAB--Port range start: $(($MCSettings | Where-Object { $_.PropertyName -eq "StartPort" }).Value)")
+                    $RoleSettings += @("--TAB--Port range end: $(($MCSettings | Where-Object { $_.PropertyName -eq "EndPort" }).Value)")
+                    $RoleSettings += @("- Maximum clients: $(($MCSettings | Where-Object { $_.PropertyName -eq "Multicast Max Clients" }).Value)")
+                    If (($MCSettings | Where-Object { $_.PropertyName -eq "Multicast Session Schedule Cast" }).Value -eq 1) {
                         $RoleSettings += @("- Scheduled multicast - CHECKED")
-                        $RoleSettings += @("--TAB--Session start delay (minutes): $(($MCSettings | ? { $_.PropertyName -eq "Multicast Session Start Delay" }).Value)")
-                        $RoleSettings += @("--TAB--Minimum session size (clients): $(($MCSettings | ? { $_.PropertyName -eq "Multicast Session Minimum Size" }).Value)")
+                        $RoleSettings += @("--TAB--Session start delay (minutes): $(($MCSettings | Where-Object { $_.PropertyName -eq "Multicast Session Start Delay" }).Value)")
+                        $RoleSettings += @("--TAB--Minimum session size (clients): $(($MCSettings | Where-Object { $_.PropertyName -eq "Multicast Session Minimum Size" }).Value)")
                     }
                     Else {
                         $RoleSettings += @("- Scheduled multicast - UNCHECKED")
@@ -1503,9 +2567,9 @@ If ($ListAllInformation){
                 $RoleSettings += @("- Multicast support: Disabled")
             }
             $RoleSettings += @("--B--Content Validation--/B--")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "DPMonEnabled" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "DPMonEnabled" }).Value -eq 1) {
                 $RoleSettings += @("- Content validation schedule: Enabled")
-                $Schedule = Convert-CMSchedule -ScheduleString ($SiteRole.Props | ? { $_.PropertyName -eq "DPMonSchedule" }).Value1
+                $Schedule = Convert-CMSchedule -ScheduleString ($SiteRole.Props | Where-Object { $_.PropertyName -eq "DPMonSchedule" }).Value1
                 if ($Schedule.DaySpan -gt 0) {
                     $RoleSettings += @("--TAB--Occurs every $($Schedule.DaySpan) days effective $($Schedule.StartTime)")
                 }
@@ -1536,7 +2600,7 @@ If ($ListAllInformation){
                         $RoleSettings += @("--TAB--Occurs the $($order) $(Convert-WeekDay $Schedule.Day) of every $($Schedule.ForNumberOfMonths) months effective $($Schedule.StartTime)")
                     }
                 }
-                Switch (($SiteRole.Props | ? { $_.PropertyName -eq "DPMonPriority" }).Value) {
+                Switch (($SiteRole.Props | Where-Object { $_.PropertyName -eq "DPMonPriority" }).Value) {
                     4 { $ValidPriority = "Lowest" }
                     5 { $ValidPriority = "Low" }
                     6 { $ValidPriority = "Medium" }
@@ -1549,7 +2613,7 @@ If ($ListAllInformation){
                 $RoleSettings += @("- Content validation schedule: Disabled")
             }
             $RoleSettings += @("--B--Boundary Groups--/B--")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "DistributeOnDemand" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "DistributeOnDemand" }).Value -eq 1) {
                 $RoleSettings += @("- Enable for on-demand distribution - CHECKED")
             }
             Else {
@@ -1581,7 +2645,7 @@ If ($ListAllInformation){
                     $RoleSettings += @("--TAB--Delay between data blocks (seconds): $($DPInfo.PropLists.Values[2])")
                 }
                 $RoleSettings += @("--B--Pull Distribution Point--/B--")
-                If (($SiteRole.Props | ? { $_.PropertyName -eq "IsPullDP" }).Value -eq 1) {
+                If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "IsPullDP" }).Value -eq 1) {
                     $RoleSettings += @("- Enable to pull content from other DP - CHECKED")
                 }
                 Else {
@@ -1603,16 +2667,16 @@ If ($ListAllInformation){
                 $RoleSettings += @("- Generate alert when the MP is not healthy - UNCHECKED")
             }
             $RoleSettings += @("--B--Management Point Database--/B--")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "UseSiteDatabase" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "UseSiteDatabase" }).Value -eq 1) {
                 $RoleSettings += @("- Database: Site database")
             }
             Else {
                 $RoleSettings += @("- Database: Database replica")
-                $RoleSettings += @("--TAB--Database server: $(($SiteRole.Props | ? { $_.PropertyName -eq "SQLServerName" }).Value1)")
-                $RoleSettings += @("--TAB--Database name: $(($SiteRole.Props | ? { $_.PropertyName -eq "DatabaseName" }).Value1)")
+                $RoleSettings += @("--TAB--Database server: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "SQLServerName" }).Value1)")
+                $RoleSettings += @("--TAB--Database name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "DatabaseName" }).Value1)")
             }
-            If (-not [String]::IsNullOrEmpty(($SiteRole.Props | ? { $_.PropertyName -eq "UserName" }).Value1)) {
-                $RoleSettings += @("- Connection account: $(($SiteRole.Props | ? { $_.PropertyName -eq "UserName" }).Value1)")
+            If (-not [String]::IsNullOrEmpty(($SiteRole.Props | Where-Object { $_.PropertyName -eq "UserName" }).Value1)) {
+                $RoleSettings += @("- Connection account: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "UserName" }).Value1)")
             }
             Else {
                 $RoleSettings += @("- Connection account: MP's computer account")
@@ -1623,8 +2687,8 @@ If ($ListAllInformation){
         'SMS Fallback Status Point' {
             $RoleName = "Fallback status point"
             $RoleSettings += @("--B--General--/B--")
-            $RoleSettings += @("- Number of state messages: $(($SiteRole.Props | ? { $_.PropertyName -eq "Throttle Count" }).Value)")
-            $RoleSettings += @("- Throttle interval (seconds): $(($SiteRole.Props | ? { $_.PropertyName -eq "Throttle Interval" }).Value)")
+            $RoleSettings += @("- Number of state messages: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "Throttle Count" }).Value)")
+            $RoleSettings += @("- Throttle interval (seconds): $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "Throttle Interval" }).Value)")
         }
         #endregion RoleFSP
         #region RoleSQL
@@ -1647,30 +2711,30 @@ If ($ListAllInformation){
         'SMS SRS Reporting Point' {
             $RoleName = "Reporting services point"
             $RoleSettings += @("--B--General--/B--")
-            $RoleSettings += @("- Database server name: $(($SiteRole.Props | ? { $_.PropertyName -eq "DatabaseServerName" }).Value2)")
-            $RoleSettings += @("- Database name: $(($SiteRole.Props | ? { $_.PropertyName -eq "DatabaseName" }).Value2)")
-            $RoleSettings += @("- Folder name: $(($SiteRole.Props | ? { $_.PropertyName -eq "RootFolder" }).Value2)")
-            $RoleSettings += @("- Reporting Services server instance: $(($SiteRole.Props | ? { $_.PropertyName -eq "ReportServerInstance" }).Value2)")
-            $RoleSettings += @("- Reporting Services manager URI: $(($SiteRole.Props | ? { $_.PropertyName -eq "ReportManagerUri" }).Value2)")
-            $RoleSettings += @("- Reporting Services server URI: $(($SiteRole.Props | ? { $_.PropertyName -eq "ReportServerUri" }).Value2)")
-            $RoleSettings += @("- Reporting Services account: $(($SiteRole.Props | ? { $_.PropertyName -eq "Username" }).Value2)")
+            $RoleSettings += @("- Database server name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "DatabaseServerName" }).Value2)")
+            $RoleSettings += @("- Database name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "DatabaseName" }).Value2)")
+            $RoleSettings += @("- Folder name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "RootFolder" }).Value2)")
+            $RoleSettings += @("- Reporting Services server instance: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ReportServerInstance" }).Value2)")
+            $RoleSettings += @("- Reporting Services manager URI: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ReportManagerUri" }).Value2)")
+            $RoleSettings += @("- Reporting Services server URI: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ReportServerUri" }).Value2)")
+            $RoleSettings += @("- Reporting Services account: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "Username" }).Value2)")
         }
         #endregion RoleRSP
         #region RoleSUP
         'SMS Software Update Point' {
             $RoleName = "Software update point"
             $RoleSettings += @("--B--General--/B--")
-            $RoleSettings += @("- WSUS port: $(($SiteRole.Props | ? { $_.PropertyName -eq "WSUSIISPort" }).Value)")
-            $RoleSettings += @("- WSUS SSL port: $(($SiteRole.Props | ? { $_.PropertyName -eq "WSUSIISSSLPort" }).Value)")
-            $RoleSettings += @("- WSUS DB name: $(($SiteRole.Props | ? { $_.PropertyName -eq "DBServerName" }).Value2)")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "SSLWSUS" }).Value -eq 1) {
+            $RoleSettings += @("- WSUS port: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "WSUSIISPort" }).Value)")
+            $RoleSettings += @("- WSUS SSL port: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "WSUSIISSSLPort" }).Value)")
+            $RoleSettings += @("- WSUS DB name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "DBServerName" }).Value2)")
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "SSLWSUS" }).Value -eq 1) {
                 $RoleSettings += @("- WSUS requires SSL - CHECKED")
             }
             Else {
                 $RoleSettings += @("- WSUS requires SSL - UNCHECKED")
             }
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "IsIntranet" }).Value -eq 1) {
-                If (($SiteRole.Props | ? { $_.PropertyName -eq "IsINF" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "IsIntranet" }).Value -eq 1) {
+                If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "IsINF" }).Value -eq 1) {
                     $RoleSettings += @("- WSUS connection type: Allow Internet and Intranet client connections")
                 }
                 Else {
@@ -1681,20 +2745,20 @@ If ($ListAllInformation){
                 $RoleSettings += @("- WSUS connection type: Allow Internet-only client connections")
             }
             $RoleSettings += @("--B--Proxy And Account Settings--/B--")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "UseProxy" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "UseProxy" }).Value -eq 1) {
                 $RoleSettings += @("- Use proxy when synchronizing software updates - CHECKED")
             }
             Else {
                 $RoleSettings += @("- Use proxy when synchronizing software updates - UNCHECKED")
             }
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "UseProxyForADR" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "UseProxyForADR" }).Value -eq 1) {
                 $RoleSettings += @("- Use proxy when downloading content by using ADR - CHECKED")
             }
             Else {
                 $RoleSettings += @("- Use proxy when downloading content by using ADR - UNCHECKED")
             }
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "WSUSAccessAccount" }).Value2 -ne "") {
-                $RoleSettings += @("- WSUS connection account: $(($SiteRole.Props | ? { $_.PropertyName -eq "WSUSAccessAccount" }).Value2)")
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "WSUSAccessAccount" }).Value2 -ne "") {
+                $RoleSettings += @("- WSUS connection account: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "WSUSAccessAccount" }).Value2)")
             }
             Else {
                 $RoleSettings += @("- WSUS connection account: No account defined")
@@ -1705,18 +2769,18 @@ If ($ListAllInformation){
         'SMS Application Web Service' {
             $RoleName = "Application Catalog web service point"
             $RoleSettings += @("--B--General--/B--")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "ServiceIISWebSite" }).Value1 -eq "") {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "ServiceIISWebSite" }).Value1 -eq "") {
                 $RoleSettings += @("- IIS website: Default Web Site")
             }
             Else {
-                $RoleSettings += @("- IIS website: $(($SiteRole.Props | ? { $_.PropertyName -eq "ServiceIISWebSite" }).Value1)")
+                $RoleSettings += @("- IIS website: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ServiceIISWebSite" }).Value1)")
             }
-            $RoleSettings += @("- Web application name: $(($SiteRole.Props | ? { $_.PropertyName -eq "ServiceName" }).Value1)")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "SslState" }).Value -eq 0) {
-                $RoleSettings += @("- Port: $(($SiteRole.Props | ? { $_.PropertyName -eq "ServicePort" }).Value) (HTTP)")
+            $RoleSettings += @("- Web application name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ServiceName" }).Value1)")
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "SslState" }).Value -eq 0) {
+                $RoleSettings += @("- Port: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ServicePort" }).Value) (HTTP)")
             }
             Else {
-                $RoleSettings += @("- Port: $(($SiteRole.Props | ? { $_.PropertyName -eq "ServicePort" }).Value) (HTTPS)")
+                $RoleSettings += @("- Port: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ServicePort" }).Value) (HTTPS)")
             }
         }
         #endregion RoleSC
@@ -1724,25 +2788,25 @@ If ($ListAllInformation){
         'SMS Portal Web Site' {
             $RoleName = "Application Catalog website point"
             $RoleSettings += @("--B--General--/B--")
-            $RoleSettings += @("- IIS web site: $(($SiteRole.Props | ? { $_.PropertyName -eq "PortalIISWebSite" }).Value1)")
-            $RoleSettings += @("- Web application name: $(($SiteRole.Props | ? { $_.PropertyName -eq "PortalName" }).Value1)")
-            $RoleSettings += @("- NetBIOS name: $(($SiteRole.Props | ? { $_.PropertyName -eq "NetbiosName" }).Value1)")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "SslState" }).Value -eq 0) {
-                $RoleSettings += @("- Port: $(($SiteRole.Props | ? { $_.PropertyName -eq "PortalPort" }).Value) (HTTP)")
+            $RoleSettings += @("- IIS web site: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "PortalIISWebSite" }).Value1)")
+            $RoleSettings += @("- Web application name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "PortalName" }).Value1)")
+            $RoleSettings += @("- NetBIOS name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "NetbiosName" }).Value1)")
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "SslState" }).Value -eq 0) {
+                $RoleSettings += @("- Port: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "PortalPort" }).Value) (HTTP)")
             }
             Else {
-                $RoleSettings += @("- Port: $(($SiteRole.Props | ? { $_.PropertyName -eq "PortalSslPort" }).Value) (HTTPS)")
+                $RoleSettings += @("- Port: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "PortalSslPort" }).Value) (HTTPS)")
             }
             $RoleSettings += @("--B--Customization--/B--")
-            $RoleSettings += @("Organization name: $(($SiteRole.Props | ? { $_.PropertyName -eq "BrandingString" }).Value1)")
-            $RoleSettings += @("Website theme: #$(($SiteRole.Props | ? { $_.PropertyName -eq "PortalThemeColor" }).Value1)")
+            $RoleSettings += @("Organization name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "BrandingString" }).Value1)")
+            $RoleSettings += @("Website theme: #$(($SiteRole.Props | Where-Object { $_.PropertyName -eq "PortalThemeColor" }).Value1)")
         }
         #endregion RoleSCWeb
         #region RoleSCP
         'SMS Dmp Connector' {
             $RoleName = "Service connection point"
             $RoleSettings += @("--B--General--/B--")
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "OfflineMode" }).Value -eq 0) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "OfflineMode" }).Value -eq 0) {
                 $RoleSettings += @("- Mode: Online")
             }
             Else {
@@ -1821,11 +2885,11 @@ If ($ListAllInformation){
         'SMS Enrollment Server' {
             $RoleName = "Enrollment point"
             $RoleSettings += @("--B--General--/B--")
-            $RoleSettings += @("- Website name: $(($SiteRole.Props | ? { $_.PropertyName -eq "ServiceIISWebSite" }).Value1)")
-            $RoleSettings += @("- Port: $(($SiteRole.Props | ? { $_.PropertyName -eq "ServicePort" }).Value)")
-            $RoleSettings += @("- Virtual application name: $(($SiteRole.Props | ? { $_.PropertyName -eq "ServiceName" }).Value1)")
-            If (-not [String]::IsNullOrEmpty(($SiteRole.Props | ? { $_.PropertyName -eq "UserName" }).Value1)) {
-                $RoleSettings += @("- Connection account: $(($SiteRole.Props | ? { $_.PropertyName -eq "UserName" }).Value1)")
+            $RoleSettings += @("- Website name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ServiceIISWebSite" }).Value1)")
+            $RoleSettings += @("- Port: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ServicePort" }).Value)")
+            $RoleSettings += @("- Virtual application name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ServiceName" }).Value1)")
+            If (-not [String]::IsNullOrEmpty(($SiteRole.Props | Where-Object { $_.PropertyName -eq "UserName" }).Value1)) {
+                $RoleSettings += @("- Connection account: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "UserName" }).Value1)")
             }
             Else {
                 $RoleSettings += @("- Connection account: Enrollment point's computer account")
@@ -1836,10 +2900,10 @@ If ($ListAllInformation){
         'SMS Enrollment Web Site' {
             $RoleName = "Enrollment proxy point"
             $RoleSettings += @("--B--General--/B--")
-            $RoleSettings += @("- Enrollment point: HTTPS://$(($SiteRole.Props | ? { $_.PropertyName -eq "ServiceHostName" }).Value1):$(($SiteRole.Props | ? { $_.PropertyName -eq "ServicePort" }).Value)/$(($SiteRole.Props | ? { $_.PropertyName -eq "ServiceName" }).Value1)")
-            $RoleSettings += @("- Website name: $(($SiteRole.Props | ? { $_.PropertyName -eq "EnrollWebIISWebSite" }).Value1)")
-            $RoleSettings += @("- Port: $(($SiteRole.Props | ? { $_.PropertyName -eq "EnrollWebPort" }).Value)")
-            $RoleSettings += @("- Virtual application name: $(($SiteRole.Props | ? { $_.PropertyName -eq "EnrollWebName" }).Value1)")
+            $RoleSettings += @("- Enrollment point: HTTPS://$(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ServiceHostName" }).Value1):$(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ServicePort" }).Value)/$(($SiteRole.Props | Where-Object { $_.PropertyName -eq "ServiceName" }).Value1)")
+            $RoleSettings += @("- Website name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "EnrollWebIISWebSite" }).Value1)")
+            $RoleSettings += @("- Port: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "EnrollWebPort" }).Value)")
+            $RoleSettings += @("- Virtual application name: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "EnrollWebName" }).Value1)")
         }
         #endregion RoleEnrollWeb
         #region RoleSMP
@@ -1847,7 +2911,7 @@ If ($ListAllInformation){
             $RoleName = "State migration point"
             $RoleSettings += @("--B--General--/B--")
             $RoleSettings += @("- Folder details:")
-            ($SiteRole.PropLists | ? { $_.PropertyListName -eq "Directories" }).Values | % {
+            ($SiteRole.PropLists | Where-Object { $_.PropertyListName -eq "Directories" }).Values | ForEach-Object {
                 $StateDirectory = $_ -split "=|;"
                 Switch ($StateDirectory[7]) {
                     1 { $SpaceUnit = "MB" }
@@ -1856,13 +2920,13 @@ If ($ListAllInformation){
                 }
                 $RoleSettings += @("--TAB--Storage folder: $($StateDirectory[1]) | Max clients: $($StateDirectory[3]) | Min free space: $($StateDirectory[5])$SpaceUnit")
             }
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "SMPStoreDeletionCycleTimeInMinutes" }).Value -eq 0) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "SMPStoreDeletionCycleTimeInMinutes" }).Value -eq 0) {
                 $RoleSettings += @("- Deletion policy: Immediatly")
             }
             Else {
-                $RoleSettings += @("- Deletion policy: $(($SiteRole.Props | ? { $_.PropertyName -eq "SMPStoreDeletionCycleTimeInMinutes" }).Value) minutes")
+                $RoleSettings += @("- Deletion policy: $(($SiteRole.Props | Where-Object { $_.PropertyName -eq "SMPStoreDeletionCycleTimeInMinutes" }).Value) minutes")
             }
-            If (($SiteRole.Props | ? { $_.PropertyName -eq "SMPQuiesceState" }).Value -eq 1) {
+            If (($SiteRole.Props | Where-Object { $_.PropertyName -eq "SMPQuiesceState" }).Value -eq 1) {
                 $RoleSettings += @("- Enable restore-only mode - CHECKED")
             }
             Else {
@@ -1882,7 +2946,7 @@ If ($ListAllInformation){
     $SiteRoleobject = New-Object -TypeName PSObject -Property @{'Server Name' = ($SiteRole.NALPath).ToString().Split('\\')[2]; 'Role' = $RoleName; 'Properties' = ($RoleSettings -join '--CRLF--')}
     $SiteRolesTable += $SiteRoleobject
   }
-  $SiteRolesTable = $SiteRolesTable | Sort-Object -Property 'Server Name', 'Role' | Select 'Server Name', 'Role', 'Properties'
+  $SiteRolesTable = $SiteRolesTable | Sort-Object -Property 'Server Name', 'Role' | Select-Object 'Server Name', 'Role', 'Properties'
 }else{
   $SiteRolesTable = @()  
   $SiteRoles = Get-CMSiteRole -SiteCode $CMSite.SiteCode | Select-Object -Property NALPath, rolename
@@ -1900,7 +2964,94 @@ If ($ListAllInformation){
   Write-HtmliLink -ReturnTOC -File $FilePath
   #endregion SiteRoles
 
+  #region Site Server Details
+If (-Not($PSBoundParameters.ContainsKey('SkipRemoteServerDetails'))) {
+  Write-ProgressEx -CurrentOperation "Collecting Site Server Information"
+  $SiteServers = Get-CMSiteSystemServer | Where-Object {$_.NALType -notlike 'Windows Azure'} | Select-Object @{Name='ServerName';expression={$_.NetworkOSPath.trim('\')}}
+  Write-HTMLHeading -Text "Site Server Information" -Level 2 -File $FilePath
+  Write-HTMLParagraph -Text "The section contains basic information on each of the site servers in the environment.  The data is collected via remote WMI queries." -Level 2 -File $FilePath
+  foreach ($SiteServer in $SiteServers){
+    $ServerInfo = @()
+    $Server = $SiteServer.ServerName
+    Write-HTMLHeading -Text "$Server" -Level 3 -File $FilePath
+    Write-ProgressEx -Id 1 -Activity "Server Details" -Status "Querying WMI" -CurrentOperation "Collecting basic information for server [$Server] via WMI."
+    Try{
+        $InstalledServerFeatures = ''
+        $InstalledFeatures=Get-WmiObject -Query 'SELECT * FROM Win32_OptionalFeature where InstallState = 1' -ComputerName $Server -ErrorAction Stop |Select-Object Caption,Name
+        foreach ($Feature in $InstalledFeatures){
+            $InstalledServerFeatures = "$InstalledServerFeatures; $($Feature.Name)"
+        }
+    }
+    Catch{
+        Write-debug "$(Get-Date):   Unable to query WMI for Installed Features on server [$Server]."
+        $InstalledFeatures=@("Feature Query Failed")
+    }
+    $InstalledServerFeatures = $InstalledServerFeatures.Trim(';')
+    Try{
+        $Drives = Get-WmiObject -Query 'SELECT * FROM Win32_LogicalDisk WHERE DriveType = 3' -ComputerName $Server -ErrorAction Stop
+        $DriveList = @()
+        Foreach ($Drive in $Drives){
+            $Letter = $Drive.DeviceID
+            $Size=[math]::Round($($Drive.Size)/1024/1024/1024,1)
+            $Free=[math]::Round($($Drive.FreeSpace)/1024/1024/1024,1)
+            $DriveList += New-Object -TypeName psobject -Property @{'DriveLetter'="$Letter";'Size'="$Size GB";'FreeSpace'="$Free GB"}
+        }
+    }
+    Catch{
+        Write-debug "$(Get-Date):   Unable to query WMI for drive info on server [$Server]."
+        $DriveList = New-Object -TypeName psobject -Property @{'DriveLetter'="NA";'Size'="NA";'FreeSpace'="NA"}
+    }
+    try{
+        [int]$Capacity = 0
+        Get-WmiObject -Class win32_physicalmemory -ComputerName $Server -ErrorAction Stop | ForEach-Object {[int64]$Capacity = $Capacity + [int64]$_.Capacity}
+        $TotalMemory = $Capacity / 1024 / 1024 / 1024
+    }
+    catch{
+        Write-debug "$(Get-Date):   Failed to collect memory information for server [$Server]."
+        [string]$TotalMemory = "Memory query failed"
+      }
+    Try{
+        $CPUs = Get-WmiObject -Class win32_processor -ComputerName $Server -ErrorAction Stop
+        [int]$Cores=0
+        foreach ($CPU in $CPUs) {
+            $Cores = $Cores + $CPU.NumberOfCores
+            $CPUModel = $CPU.Name
+        }
+    }
+    Catch{
+        Write-debug "$(Get-Date):   Failed to collect processor information for server [$Server]."
+        [string]$Cores = "Unknown"
+        $CPUModel = "Model Unknown"
+    }
+    Try{
+        $OSInfo = Get-WmiObject -Class win32_OperatingSystem -Property Caption,BuildNumber -ComputerName $Server -ErrorAction Stop
+        $OSName = $OSInfo.Caption
+        $OSBuild = $Osinfo.BuildNumber
+    }
+    Catch{
+        Write-debug "$(Get-Date):   Failed to collect OS information for server [$Server]."
+        $OSName = "Unknown"
+        $OSBuild = "Unknown"
+    }
+    $ServerInfo += New-Object -TypeName psobject -Property @{'Property'="Operating System";'Value'="$OSName"}
+    $ServerInfo += New-Object -TypeName psobject -Property @{'Property'="Operating System Build";'Value'="$OSBuild"}
+    $ServerInfo += New-Object -TypeName psobject -Property @{'Property'="Installed OS Features";'Value'="$InstalledServerFeatures"}
+    $ServerInfo += New-Object -TypeName psobject -Property @{'Property'="Total Memory";'Value'="$TotalMemory"}
+    $ServerInfo += New-Object -TypeName psobject -Property @{'Property'="CPU(Cores)";'Value'="$CPUModel ($Cores)"}
+    Foreach($Drive in $DriveList){
+        $ServerInfo += New-Object -TypeName psobject -Property @{'Property'="Local Disk ($($Drive.DriveLetter))";'Value'="Capacity: $($Drive.Size)--CRLF--Free Space: $($Drive.FreeSpace)"}
+    }
+    $ServerInfo =  $ServerInfo|Select-Object 'Property','Value'
+    Write-HtmlTable -InputObject $ServerInfo -Border 1 -Level 3 -File $FilePath
+  }
+  Write-ProgressEx -Id 1 -Activity "Server Details" -Status "Querying WMI" -CurrentOperation "End Collecting Site Server Information" -Completed
+  Write-ProgressEx -CurrentOperation "End Collecting Site Server Information"
+  Write-HtmliLink -ReturnTOC -File $FilePath
+}
+  #endregion Site Server Details
+
   #region SiteMaintenanceTasks
+  Write-ProgressEx -CurrentOperation "Site Maintenance Tasks"
   $SiteMaintenanceTaskTable = @()
   # Use WMI instead of cmdlet because WMI is more accurate and easy to use
   #$SiteMaintenanceTasks = Get-CMSiteMaintenanceTask -SiteCode $CMSite.SiteCode
@@ -1950,7 +3101,7 @@ if ($ListAllInformation){
     $SiteMaintenanceTaskTable += $SiteMaintenanceTaskRowHash;
   }
 
-  $SiteMaintenanceTaskTable = $SiteMaintenanceTaskTable | Sort-Object -Property 'Task Name' | Select 'Task Name', 'Enabled', 'Delete older than', 'Start after', 'Latest start', 'Schedule', 'Other details'
+  $SiteMaintenanceTaskTable = $SiteMaintenanceTaskTable | Sort-Object -Property 'Task Name' | Select-Object 'Task Name', 'Enabled', 'Delete older than', 'Start after', 'Latest start', 'Schedule', 'Other details'
 }else{
   $SiteMaintenanceTasks = Get-CMSiteMaintenanceTask -SiteCode $CMSite.SiteCode
   Write-HTMLHeading -Text "Site Maintenance Tasks for Site $($CMSite.SiteCode)" -Level 2 -File $FilePath
@@ -1960,14 +3111,15 @@ if ($ListAllInformation){
     $SiteMaintenanceTaskTable += $SiteMaintenanceTaskRowHash;
   }
 
-  $SiteMaintenanceTaskTable = $SiteMaintenanceTaskTable|Select 'Task Name',Enabled
+  $SiteMaintenanceTaskTable = $SiteMaintenanceTaskTable|Select-Object 'Task Name',Enabled
 }
   Write-HtmlTable -InputObject $SiteMaintenanceTaskTable -Border 1 -Level 2 -File $FilePath
   Write-HtmliLink -ReturnTOC -File $FilePath
+  Write-ProgressEx -CurrentOperation "Completed Site Maintenance Tasks"
   #endregion SiteMaintenanceTasks
   
   #region Site SQL Info
-  Write-Verbose "$(Get-Date):   Getting site SQL server and database information."
+  Write-ProgressEx -CurrentOperation "Getting site SQL server and database information"
   Write-HTMLHeading -Text "Summary of SQL database info for Site $($CMSite.SiteCode)" -PageBreak -Level 2 -File $FilePath
   $SiteDef = Get-CMSiteDefinition -SiteCode $($CMSite.SiteCode)
   $SQLServer = $SiteDef.SQLServerName
@@ -1979,7 +3131,7 @@ if ($ListAllInformation){
     $CMDatabase = $CMDB
     $SQLInstance = ''
   }
-  Write-Verbose "$(Get-Date):   SQL server: [$SQLServer]  SQL database: [$CMDatabase]  SQL Instance: [$SQLInstance]"
+  Write-ProgressEx -CurrentOperation "SQL server: [$SQLServer]  SQL database: [$CMDatabase]  SQL Instance: [$SQLInstance]"
   $SQLInfo = @("Site SQL Server: <b>$SQLServer</b>","Site Database Name: <b>$CMDatabase</b>")
   Write-HtmlList -InputObject $SQLInfo -Level 2 -File $FilePath
   #Write-HTMLParagraph -Text "$($SQLInfo)" -Level 2 -File $FilePath
@@ -2001,7 +3153,7 @@ if ($ListAllInformation){
     $SQLHWInfo += "$CPUModel"
     $SQLHWInfo += "$Cores Cores ($Threads logical)"
     $SQLHWInfo += "$($TotalMemory) GB RAM"
-    $Drives=Get-WmiObject -Class win32_LogicalDisk -ComputerName $SQLServer | Where {$_.DriveType -eq 3}
+    $Drives=Get-WmiObject -Class win32_LogicalDisk -ComputerName $SQLServer | Where-Object {$_.DriveType -eq 3}
     Foreach($Drive in $Drives){
         $SQLHWInfo += "Drive $($Drive.DeviceID) size: $([math]::Round($Drive.size/1024/1024/1024,1)) GB ($([math]::Round($Drive.FreeSpace/1024/1024/1024,1)) GB Free)"
     }
@@ -2012,9 +3164,9 @@ if ($ListAllInformation){
   Write-HtmlList -InputObject $SQLHWInfo -Description $SQLHWDesc -Level 2 -File $FilePath
   
   If ($NoSqlDetail){
-	  Write-Verbose "$(Get-Date):   Skipping SQL detailed info."
+    Write-ProgressEx -CurrentOperation "Skipping SQL detailed info."
   }Else{
-      Write-Verbose "$(Get-Date):   Getting SQL Database detailed info."
+    Write-ProgressEx -CurrentOperation "Getting SQL Database detailed info."
       Try{
           If ($SQLInstance){
                 $SQLConnectString = "$SQLServer\$SQLInstance"
@@ -2022,40 +3174,55 @@ if ($ListAllInformation){
                 $SQLConnectString = "$SQLServer"
           }
           Write-HTMLParagraph -Text "SQL instance version information:" -Level 2 -File $FilePath
-          $SQLVersion = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database Master -Query "SELECT SERVERPROPERTY (`'edition`') Edition, SERVERPROPERTY(`'productversion`') Version, SERVERPROPERTY (`'productlevel`') SP, SERVERPROPERTY (`'ProductUpdateLevel`') CU"
-          $SQLVersion = $SQLVersion | Select Edition,Version,SP,CU
+          $SQLVersion = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database Master -QueryTimeout $SQLTimeout -Query "SELECT SERVERPROPERTY (`'edition`') Edition, SERVERPROPERTY(`'productversion`') Version, SERVERPROPERTY (`'productlevel`') SP, SERVERPROPERTY (`'ProductUpdateLevel`') CU" #-Credential $SQLCredential
+          $SQLVersion = $SQLVersion | Select-Object Edition,Version,SP,CU
           Write-HtmlTable -InputObject $SQLVersion -Border 1 -Level 3 -File $FilePath
           Write-HTMLParagraph -Text "The following are important global settings on the SQL server.  Typically, this SQL server should be dedicated to Configuration Manager." -Level 2 -File $FilePath
-          $SQLConfig = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database Master -Query "SELECT name ServerSetting,value_in_use Value FROM sys.configurations where configuration_id = 1543 OR configuration_id = 1544 OR configuration_id = 1539"
-          $SQLConfig = $SQLConfig | Select @{Name='Server Setting';Expression={$_.ServerSetting}},Value
+          $SQLConfig = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database Master -QueryTimeout $SQLTimeout -Query "SELECT name ServerSetting,value_in_use Value FROM sys.configurations where configuration_id = 1543 OR configuration_id = 1544 OR configuration_id = 1539" #-Credential $SQLCredential
+          $SQLConfig = $SQLConfig | Select-Object @{Name='Server Setting';Expression={$_.ServerSetting}},Value
           Write-HtmlTable -InputObject $SQLConfig -Border 1 -Level 3 -File $FilePath
           Write-HTMLParagraph -Text "Site database information:" -Level 2 -File $FilePath
-          $DatabaseInfo = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database Master -Query "SELECT name, compatibility_level, collation_name FROM sys.Databases WHERE name='$CMDatabase'"
-          $DatabaseInfo = $DatabaseInfo | Select @{Name='Database Name';Expression={$_.name}},@{Name='Compatibility Level';Expression={$_.compatibility_level}},@{Name='Collation';Expression={$_.collation_name}}
+          $DatabaseInfo = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database Master -QueryTimeout $SQLTimeout -Query "SELECT name, compatibility_level, collation_name FROM sys.Databases WHERE name='$CMDatabase'" #-Credential $SQLCredential
+          $DatabaseInfo = $DatabaseInfo | Select-Object @{Name='Database Name';Expression={$_.name}},@{Name='Compatibility Level';Expression={$_.compatibility_level}},@{Name='Collation';Expression={$_.collation_name}}
           Write-HtmlTable -InputObject $DatabaseInfo -Border 1 -Level 3 -File $FilePath
           Write-HTMLParagraph -Text "Below are the database files for the site database ($CMDatabase):" -Level 2 -File $FilePath
-          $DatabaseFiles = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database Master -Query "SELECT db.name `'DatabaseName`',type_desc `'FileType`',physical_name `'FilePath`',mf.state_desc `'Status`',size*8/1024 `'FileSizeMB`',max_size `'MaximumSize`',growth `'GrowthRate`',(CASE WHEN is_percent_growth = 1 THEN `'Percent`' ELSE `'MB`' END) `'GrowthUnit`',create_date `'DateCreated`',compatibility_level `'DBLevel`',user_access_desc `'AccessMode`',recovery_model_desc `'RecoveryModel`' FROM sys.master_files mf INNER JOIN sys.databases db ON db.database_id = mf.database_id where db.name = `'$CMDatabase`'"
-          $DatabaseFiles = $DatabaseFiles | Select @{Name='File Type';Expression={$_.FileType}},@{Name='File Path';Expression={$_.FilePath}},Status,@{Name='File Size MB';Expression={'{0:N0}' -f $_.FileSizeMB}},@{Name='Maximum Size';Expression={$(IF($_.MaximumSize -eq -1){"Unlimited"}else{'{0:N0}' -f ($_.MaximumSize/128)})}},@{Name='Growth Rate';Expression={"$(IF($_.GrowthUnit -eq "Percent"){"$($_.GrowthRate)%"}Else{"$($_.GrowthRate/128)MB"})"}},@{Name='Recovery Model';Expression={$_.RecoveryModel}}
-          Write-HtmlTable -InputObject $DatabaseFiles -Border 1 -Level 3 -File $FilePath
+          $DatabaseFiles = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database Master -QueryTimeout $SQLTimeout -Query "SELECT db.name `'DatabaseName`',type_desc `'FileType`',physical_name `'FilePath`',mf.state_desc `'Status`',size*8/1024 `'FileSizeMB`',max_size `'MaximumSize`',growth `'GrowthRate`',(CASE WHEN is_percent_growth = 1 THEN `'Percent`' ELSE `'MB`' END) `'GrowthUnit`',create_date `'DateCreated`',compatibility_level `'DBLevel`',user_access_desc `'AccessMode`',recovery_model_desc `'RecoveryModel`' FROM sys.master_files mf INNER JOIN sys.databases db ON db.database_id = mf.database_id where db.name = `'$CMDatabase`'" #-Credential $SQLCredential
+          If ([string]::IsNullOrEmpty($DatabaseFiles)) {
+              Write-HTMLParagraph -Text "Permission to perform this action is not granted.  Run 'GRANT VIEW ANY DEFINITION TO [%UserOrGroupToGrantRightsTo%]' on the SQL instance.  See https://docs.microsoft.com/en-us/sql/relational-databases/system-catalog-views/sys-master-files-transact-sql?view=sql-server-2016#permissions for detail." -Level 7 -File $FilePath
+          } Else {
+            $DatabaseFiles = $DatabaseFiles | Select-Object @{Name='File Type';Expression={$_.FileType}},@{Name='File Path';Expression={$_.FilePath}},Status,@{Name='File Size MB';Expression={'{0:N0}' -f $_.FileSizeMB}},@{Name='Maximum Size';Expression={$(IF($_.MaximumSize -eq -1){"Unlimited"}else{'{0:N0}' -f ($_.MaximumSize/128)})}},@{Name='Growth Rate';Expression={"$(IF($_.GrowthUnit -eq "Percent"){"$($_.GrowthRate)%"}Else{"$($_.GrowthRate/128)MB"})"}},@{Name='Recovery Model';Expression={$_.RecoveryModel}}
+            Write-HtmlTable -InputObject $DatabaseFiles -Border 1 -Level 3 -File $FilePath
+          }
           Write-HTMLParagraph -Text "Below is a fragmentation summary (%) for indexes on the site database ($CMDatabase):" -Level 2 -File $FilePath
-          $IndexFragmentation = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database $CMDatabase -Query "SELECT SUM(CASE WHEN indexstats.avg_fragmentation_in_percent > 75 THEN  1 ELSE 0 END) [Over 75],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 50 AND indexstats.avg_fragmentation_in_percent <= 75) THEN  1 ELSE 0 END) [50 to 75],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 25 AND indexstats.avg_fragmentation_in_percent <= 50) THEN  1 ELSE 0 END) [25 to 50],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 5 AND indexstats.avg_fragmentation_in_percent <= 25) THEN  1 ELSE 0 END) [5 to 25],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 1 AND indexstats.avg_fragmentation_in_percent <= 5) THEN  1 ELSE 0 END) [Under 5],SUM(CASE WHEN indexstats.avg_fragmentation_in_percent < 1 THEN  1 ELSE 0 END) [Not Fragmented] FROM sys.dm_db_index_physical_stats (DB_ID(), NULL, NULL, NULL, NULL) AS indexstats JOIN sys.tables dbtables on dbtables.[object_id] = indexstats.[object_id] WHERE indexstats.database_id = DB_ID()"
-          $IndexFragmentation = $IndexFragmentation | Select 'Over 75','50 to 75','25 to 50','5 to 25','Under 5','Not Fragmented'
-          Write-HtmlTable -InputObject $IndexFragmentation -Border 1 -Level 3 -File $FilePath
+          try {
+            $IndexFragmentation = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database $CMDatabase -QueryTimeout $SQLTimeout -Query "SELECT SUM(CASE WHEN indexstats.avg_fragmentation_in_percent > 75 THEN  1 ELSE 0 END) [Over 75],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 50 AND indexstats.avg_fragmentation_in_percent <= 75) THEN  1 ELSE 0 END) [50 to 75],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 25 AND indexstats.avg_fragmentation_in_percent <= 50) THEN  1 ELSE 0 END) [25 to 50],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 5 AND indexstats.avg_fragmentation_in_percent <= 25) THEN  1 ELSE 0 END) [5 to 25],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 1 AND indexstats.avg_fragmentation_in_percent <= 5) THEN  1 ELSE 0 END) [Under 5],SUM(CASE WHEN indexstats.avg_fragmentation_in_percent < 1 THEN  1 ELSE 0 END) [Not Fragmented] FROM sys.dm_db_index_physical_stats (DB_ID(), NULL, NULL, NULL, NULL) AS indexstats JOIN sys.tables dbtables on dbtables.[object_id] = indexstats.[object_id] WHERE indexstats.database_id = DB_ID()" #-Credential $SQLCredential
+            $IndexFragmentation = $IndexFragmentation | Select-Object 'Over 75','50 to 75','25 to 50','5 to 25','Under 5','Not Fragmented'
+            Write-HtmlTable -InputObject $IndexFragmentation -Border 1 -Level 3 -File $FilePath
+          } catch {
+            If ($($error[0].Exception.Message) -eq 'Exception calling "Load" with "1" argument(s): "The user does not have permission to perform this action."') {
+                Write-HTMLParagraph -Text "Error exception: $($Error[0].exception.Message)" -Level 2 -File $FilePath
+                Write-HTMLParagraph -Text "Permission to perform this action is not granted.  Run 'GRANT VIEW SERVER STATE TO [%UserOrGroupToGrantRightsTo%]' on the SQL instance.  See https://docs.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-db-index-physical-stats-transact-sql?view=sql-server-2016#permissions for detail." -Level 7 -File $FilePath
+            } Else {
+                Write-HTMLParagraph -Text "Error exception: $($Error[0].exception.Message)" -Level 6 -File $FilePath
+                Write-Debug "$(Get-Date):   Error exception: $($Error[0].exception)"
+            }
+          }
           Write-HTMLParagraph -Text "Below is a fragmentation summary (%) for indexes on the site database ($CMDatabase) for Tables over 10 MB in size:" -Level 2 -File $FilePath
-          $IndexFragmentation10 = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database $CMDatabase -Query "SELECT SUM(CASE WHEN indexstats.avg_fragmentation_in_percent > 75 THEN  1 ELSE 0 END) [Over 75],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 50 AND indexstats.avg_fragmentation_in_percent <= 75) THEN  1 ELSE 0 END) [50 to 75],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 25 AND indexstats.avg_fragmentation_in_percent <= 50) THEN  1 ELSE 0 END) [25 to 50],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 5 AND indexstats.avg_fragmentation_in_percent <= 25) THEN  1 ELSE 0 END) [5 to 25],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 1 AND indexstats.avg_fragmentation_in_percent <= 5) THEN  1 ELSE 0 END) [Under 5],SUM(CASE WHEN indexstats.avg_fragmentation_in_percent < 1 THEN  1 ELSE 0 END) [Not Fragmented] FROM sys.dm_db_index_physical_stats (DB_ID(), NULL, NULL, NULL, NULL) AS indexstats JOIN sys.tables dbtables on dbtables.[object_id] = indexstats.[object_id] WHERE indexstats.database_id = DB_ID() AND page_count > 1280" #1280 pages is 10 MB
-          $IndexFragmentation10 = $IndexFragmentation10 | Select 'Over 75','50 to 75','25 to 50','5 to 25','Under 5','Not Fragmented'
+          $IndexFragmentation10 = Invoke-SqlDataReader -ServerInstance $SQLConnectString -Database $CMDatabase -QueryTimeout $SQLTimeout -Query "SELECT SUM(CASE WHEN indexstats.avg_fragmentation_in_percent > 75 THEN  1 ELSE 0 END) [Over 75],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 50 AND indexstats.avg_fragmentation_in_percent <= 75) THEN  1 ELSE 0 END) [50 to 75],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 25 AND indexstats.avg_fragmentation_in_percent <= 50) THEN  1 ELSE 0 END) [25 to 50],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 5 AND indexstats.avg_fragmentation_in_percent <= 25) THEN  1 ELSE 0 END) [5 to 25],SUM(CASE WHEN (indexstats.avg_fragmentation_in_percent > 1 AND indexstats.avg_fragmentation_in_percent <= 5) THEN  1 ELSE 0 END) [Under 5],SUM(CASE WHEN indexstats.avg_fragmentation_in_percent < 1 THEN  1 ELSE 0 END) [Not Fragmented] FROM sys.dm_db_index_physical_stats (DB_ID(), NULL, NULL, NULL, NULL) AS indexstats JOIN sys.tables dbtables on dbtables.[object_id] = indexstats.[object_id] WHERE indexstats.database_id = DB_ID() AND page_count > 1280" #-Credential $SQLCredential #1280 pages is 10 MB
+          $IndexFragmentation10 = $IndexFragmentation10 | Select-Object 'Over 75','50 to 75','25 to 50','5 to 25','Under 5','Not Fragmented'
           Write-HtmlTable -InputObject $IndexFragmentation10 -Border 1 -Level 3 -File $FilePath
       }
       Catch{
-          Write-Host -ForegroundColor Yellow 'Failed to collect all detailed SQL data.'
-          Write-Verbose "$(Get-Date):   Error exception: $($Error[0].exception)"
+          Write-Warning 'Failed to collect all detailed SQL data.'
+          Write-Debug "$(Get-Date):   Error exception: $($Error[0].exception)"
       }
-      Write-Verbose "$(Get-Date):   SQL detailed info complete."
+      Write-ProgressEx -CurrentOperation "SQL detailed info complete."
   }
   Write-HtmliLink -ReturnTOC -File $FilePath
   #endregion Getting Site SQL Info
 
   #region Management Points
+  Write-ProgressEx -CurrentOperation "Management Points"
   $CMManagementPoints = Get-CMManagementPoint -SiteCode $CMSite.SiteCode
   Write-HTMLHeading -Text "Summary of Management Points for Site $($CMSite.SiteCode)" -PageBreak -Level 2 -File $FilePath
   foreach ($CMManagementPoint in $CMManagementPoints)
@@ -2063,15 +3230,15 @@ if ($ListAllInformation){
     $MPText = @()
     #Write-Verbose "$(Get-Date):   Management Point: $($CMManagementPoint)"
     $MPName = $CMManagementPoint.NetworkOSPath.Split('\\')[2]
-    Write-Verbose "$(Get-Date):   Management Point Name: $MPName"
+    Write-ProgressEx -CurrentOperation "Management Point Name: $MPName" -Activity "Managent Points" -Status "Collecting from DB" -Id 2
     [bool]$SSLENabled = if($CMManagementPoint.SslState -eq 0){$false}else{$true}
     $MPText += "SSL Enabled: $SSLENabled"
-    $UseSiteDB = ($CMManagementPoint.props|Where{$_.PropertyName -like "UseSiteDatabase"}).value
+    $UseSiteDB = ($CMManagementPoint.props|Where-Object {$_.PropertyName -like "UseSiteDatabase"}).value
     [bool]$UseSiteDB = if($UseSiteDB -eq 1) {$true}else{$false}
     $MPText += "Using Site Database: $UseSiteDB"
-    $MPIntranet = ($CMManagementPoint.props|Where{$_.PropertyName -like "MPIntranetFacing"}).value
-    $MPInternet = ($CMManagementPoint.props|Where{$_.PropertyName -like "MPInternetFacing"}).value
-    Write-Verbose "$(Get-Date): Internet: $MPInternet Intranet: $MPIntranet"
+    $MPIntranet = ($CMManagementPoint.props|Where-Object {$_.PropertyName -like "MPIntranetFacing"}).value
+    $MPInternet = ($CMManagementPoint.props|Where-Object {$_.PropertyName -like "MPInternetFacing"}).value
+    Write-Debug "$(Get-Date): Internet: $MPInternet Intranet: $MPIntranet"
     If (!($MPIntranet) -and !($MPInternet)) {[bool]$MPIntranet = $true; [bool]$MPInternet = $false}
     Else {
         [bool]$MPIntranet = If($MPIntranet -eq 1){$true}else{$false}
@@ -2082,37 +3249,41 @@ if ($ListAllInformation){
     Write-HtmlList -InputObject $MPText -Title "Management Point Name: <B>$MPName</B>" -Level 2 -File $FilePath
     Remove-Variable MPIntranet
     Remove-Variable MPInternet
-    Write-Verbose "$(Get-Date):   Test-Path -Path `"filesystem::\\$MPName\C$`""
+    Write-Debug "$(Get-Date):   Test-Path -Path `"filesystem::\\$MPName\C$`""
     $local1 = (Get-Location).path
     Set-Location C:
     $PathTest = Test-Path -Path "filesystem::\\$MPName\C$"
-    Write-Verbose "$(Get-Date):   Testing Access to Management Point: $MPName -- $PathTest"
+    Write-Debug "$(Get-Date):   Testing Access to Management Point: $MPName -- $PathTest"
     If (Test-Path -Path "filesystem::\\$MPName\C$") {$CMMPServerName=$MPName}
     Set-Location $local1
   }
+  Write-ProgressEx -CurrentOperation "Complete" -Activity "Management Points" -Status "Complete" -Id 2 -Completed
   Write-HtmliLink -ReturnTOC -File $FilePath
-  Write-Verbose "$(Get-Date):   Default Management Point: $CMMPServerName"
+  Write-Debug "$(Get-Date):   Default Management Point: $CMMPServerName"
   #endregion Management Points
   
   #region Distribution Point details
+  Write-ProgressEx -CurrentOperation "Distribution Point(s) Summary"
   Write-HTMLHeading -Text "Summary of Distribution Points for Site $($CMSite.SiteCode)" -Level 2 -PageBreak -File $FilePath
   $CMDistributionPoints = Get-CMDistributionPoint -SiteCode $CMSite.SiteCode
   
+If (-not($PSBoundParameters.ContainsKey('SkipRemoteServerDetails'))) {
   foreach ($CMDistributionPoint in $CMDistributionPoints)
   {
     $CMDPServerName = $CMDistributionPoint.NetworkOSPath.Split('\\')[2]
     Write-Verbose "$(Get-Date):   Found DP: $($CMDPServerName)"
+    Write-ProgressEx -CurrentOperation "Found DP: $($CMDPServerName)" -Activity "Distribution Points" -Status "Collecting from DB and WMI" -Id 3
     Write-HTMLHeading -Text "$CMDPServerName" -Level 3 -File $FilePath
     Write-Verbose "Trying to ping $($CMDPServerName)"
     $PingResult = Ping-Host $CMDPServerName
     if (-not ($PingResult))
     {
-      Write-Verbose "Ping Failed: $($CMDPServerName)"
+      Write-Debug "Ping Failed: $($CMDPServerName)"
       Write-HTMLParagraph -Text "The Distribution Point $($CMDPServerName) is not reachable. Check connectivity." -Level 3 -File $FilePath
     }
     else
     {
-      Write-Verbose "Ping Succeeded: $($CMDPServerName)"
+      Write-Debug "Ping Succeeded: $($CMDPServerName)"
       Write-HTMLParagraph -Text "<B>Disk Information:</B>" -Level 4 -File $FilePath
       $CMDPDrives = @(Get-WmiObject -Class SMS_DistributionPointDriveInfo -Namespace root\sms\site_$SiteCode -ComputerName $SMSProvider).Where({$PSItem.NALPath -like "*$CMDPServerName*"})
       $DPDrives = @()
@@ -2140,6 +3311,7 @@ if ($ListAllInformation){
         $DPText = $DPText + "<BR />Failed to access server $CMDPServerName.<BR /><BR />" 
         }
     }
+}
     Write-HTMLParagraph -Text "$DPText" -Level 4 -File $FilePath
     $DPText = "<B>Additional Configuration:</B><ul>"
     $DPInfo = $CMDistributionPoint.Props
@@ -2165,7 +3337,7 @@ if ($ListAllInformation){
     Write-HTMLParagraph -Text $DPText -Level 4 -File $FilePath
     $DPGroupMembers = $Null
     $DPGroupIDs = $Null
-    $DPGroupMembers = (Get-WmiObject -class SMS_DPGroupMembers -Namespace root\sms\site_$SiteCode -ComputerName $SMSProvider) | Where {$_.DPNALPath -ilike "*$($CMDPServerName)*"}
+    $DPGroupMembers = (Get-WmiObject -class SMS_DPGroupMembers -Namespace root\sms\site_$SiteCode -ComputerName $SMSProvider) | Where-Object {$_.DPNALPath -ilike "*$($CMDPServerName)*"}
     if (-not [string]::IsNullOrEmpty($DPGroupMembers))
     {
       $DPGroupIDs = $DPGroupMembers.GroupID
@@ -2190,19 +3362,22 @@ if ($ListAllInformation){
     Write-HTMLParagraph -Text $DPText -Level 4 -File $FilePath
   }
   Write-HtmliLink -ReturnTOC -File $FilePath
+  Write-ProgressEx -CurrentOperation "Completed DPs" -Activity "Distribution Points" -Status "Collecting from DB and WMI" -Id 3 -Completed
+  Write-ProgressEx -CurrentOperation "Completed Distribution Point(s) Summary"
   #endregion Distribution Point details
 
   #region enumerating Software Update Points and Configuration
+  Write-ProgressEx -CurrentOperation "Software Update configuration for Site"
   Write-HTMLHeading -Text "Software Update configuration for Site $($CMSite.SiteCode)" -Level 2 -PageBreak -File $FilePath
   
   Write-HTMLHeading -Text "Software Update Point Component Settings for Site $($CMSite.SiteCode)" -Level 3 -File $FilePath
   Write-HTMLParagraph -Text "This is a list of all of the software update classifications and products that are syncronized into the site as well as some of the general site configuration settings." -Level 3 -File $FilePath
 
-  $cats=Get-CMSoftwareUpdateCategory
-  $UpdatesClassifications = $cats|where {$_.CategoryTypeName -eq "UpdateClassification" -and $_.AllowSubscription -eq $true}
-  $SubscribedUpdatesClassifications = $UpdatesClassifications|where {$_.IsSubscribed -eq $true}
-  $Products = $cats|where {$_.CategoryTypeName -eq "Product" -and $_.AllowSubscription -eq $true}
-  $SubscribedProducts = $Products|where {$_.IsSubscribed -eq $true}
+  $cats=Get-CMSoftwareUpdateCategory -Fast
+  $UpdatesClassifications = $cats|Where-Object {$_.CategoryTypeName -eq "UpdateClassification" -and $_.AllowSubscription -eq $true}
+  $SubscribedUpdatesClassifications = $UpdatesClassifications|Where-Object {$_.IsSubscribed -eq $true}
+  $Products = $cats|Where-Object {$_.CategoryTypeName -eq "Product" -and $_.AllowSubscription -eq $true}
+  $SubscribedProducts = $Products|Where-Object {$_.IsSubscribed -eq $true}
   $SupProperties = (Get-CMSoftwareUpdatePointComponent).props
 
   $SUPPropertyList = @()
@@ -2241,13 +3416,13 @@ if ($ListAllInformation){
   Write-HTMLHeading -Text "Selected Software Update Classifications" -Level 4 -File $FilePath
   Write-HtmlList -InputObject ($SubscribedUpdatesClassifications.LocalizedCategoryInstanceName) -Level 4 -File $FilePath
   Write-HTMLHeading -Text "Selected Software Update Point Software Products" -Level 4 -File $FilePath
-  Write-HtmlList -InputObject ($SubscribedProducts.LocalizedCategoryInstanceName) -Level 4 -File $FilePath
+  Write-HtmlList -InputObject ($SubscribedProducts.LocalizedCategoryInstanceName | Sort-Object) -Level 4 -File $FilePath
 
 
-  Write-Verbose "$(Get-Date):   Enumerating all Software Update Points"
+  Write-ProgressEx -CurrentOperation "Enumerating all Software Update Points"
   Write-HTMLHeading -Text "Software Update Point Servers for Site $($CMSite.SiteCode)" -Level 3 -File $FilePath
   Write-HTMLParagraph -Text "Below is the basic configuration and settings for each software update point in the site." -Level 4 -File $FilePath
-  Write-Verbose "Get-WmiObject -Class sms_sci_sysresuse -Namespace root\sms\site_$($CMSite.SiteCode) -ComputerName $SMSProvider | Where-Object {$_.rolename -eq `'SMS Software Update Point`'}"
+  Write-debug "Get-WmiObject -Class sms_sci_sysresuse -Namespace root\sms\site_$($CMSite.SiteCode) -ComputerName $SMSProvider | Where-Object {$_.rolename -eq `'SMS Software Update Point`'}"
   $CMSUPs = Get-WmiObject -Class sms_sci_sysresuse -Namespace root\sms\site_$($CMSite.SiteCode) -ComputerName $SMSProvider | Where-Object {$_.rolename -eq 'SMS Software Update Point'}
   #$CMSUPs = (Get-CMSoftwareUpdatePoint).Where({$_.SiteCode -eq "$($CMSite.SiteCode)"})
   if (-not [string]::IsNullOrEmpty($CMSUPs))
@@ -2255,23 +3430,23 @@ if ($ListAllInformation){
     foreach ($CMSUP in $CMSUPs) {
       $SUPPropertyTable = @();
       $CMSUPServerName = $CMSUP.NetworkOSPath.split('\\')[2]
-      Write-Verbose "$(Get-Date):   Found SUP: $($CMSUPServerName)"
+      Write-Debug "$(Get-Date):   Found SUP: $($CMSUPServerName)"
       Write-HTMLHeading -Text "$($CMSUPServerName)" -Level 4 -File $FilePath
-      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'WSUS IIS Port'; Value = (($CMSUP.props|select Propertyname,Value,Value1,Value2| where {$_.PropertyName -like 'WSUSIISPORT'}).value)}
+      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'WSUS IIS Port'; Value = (($CMSUP.props|Select-Object Propertyname,Value,Value1,Value2| Where-Object {$_.PropertyName -like 'WSUSIISPORT'}).value)}
       #8530
-      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'Database'; Value = (($CMSUP.props|select Propertyname,Value,Value1,Value2| where {$_.PropertyName -like 'DBServerName'}).value2)}
+      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'Database'; Value = (($CMSUP.props|Select-Object Propertyname,Value,Value1,Value2| Where-Object {$_.PropertyName -like 'DBServerName'}).value2)}
       #soup-cm1.soup.steamedsoup.com\MICROSOFT##WID
-      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'Access Account'; Value = (($CMSUP.props|select Propertyname,Value,Value1,Value2| where {$_.PropertyName -like 'WSUSAccessAccount'}).value2)}
+      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'Access Account'; Value = (($CMSUP.props|Select-Object Propertyname,Value,Value1,Value2| Where-Object {$_.PropertyName -like 'WSUSAccessAccount'}).value2)}
       #soup.steamedsoup.com\SVC-SCCM-RAA
-      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'SSL Enabled'; Value = (($CMSUP.props|select Propertyname,Value,Value1,Value2| where {$_.PropertyName -like 'SSLWSUS'}).value)}
+      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'SSL Enabled'; Value = (($CMSUP.props|Select-Object Propertyname,Value,Value1,Value2| Where-Object {$_.PropertyName -like 'SSLWSUS'}).value)}
       #0
-      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'SSL Port'; Value = (($CMSUP.props|select Propertyname,Value,Value1,Value2| where {$_.PropertyName -like 'WSUSIISSSLPORT'}).value)}
+      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'SSL Port'; Value = (($CMSUP.props|Select-Object Propertyname,Value,Value1,Value2| Where-Object {$_.PropertyName -like 'WSUSIISSSLPORT'}).value)}
       #8531
-      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'SUP Enabled'; Value = (($CMSUP.props|select Propertyname,Value,Value1,Value2| where {$_.PropertyName -like 'Enabled'}).value)}
+      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'SUP Enabled'; Value = (($CMSUP.props|Select-Object Propertyname,Value,Value1,Value2| Where-Object {$_.PropertyName -like 'Enabled'}).value)}
       #1
-      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'Proxy Enabled'; Value = (($CMSUP.props|select Propertyname,Value,Value1,Value2| where {$_.PropertyName -like 'UseProxy'}).value)}
+      $SUPPropertyTable += New-Object -TypeName psobject -Property @{Name = 'Proxy Enabled'; Value = (($CMSUP.props|Select-Object Propertyname,Value,Value1,Value2| Where-Object {$_.PropertyName -like 'UseProxy'}).value)}
       #0
-      $SUPPropertyTable = $SUPPropertyTable|Select Name,Value
+      $SUPPropertyTable = $SUPPropertyTable|Select-Object Name,Value
       Write-HtmlTable -InputObject $SUPPropertyTable -Border 1 -Level 4 -File $FilePath
       }
   }
@@ -2279,16 +3454,16 @@ if ($ListAllInformation){
   {
     Write-HTMLParagraph -Text "This site has no Software Update Points installed." -Level 3 -File $FilePath
   }
-  Write-Verbose "$(Get-Date):   Completed Enumeration of Software Update Points"
+  Write-ProgressEx -CurrentOperation "Completed Enumeration of Software Update Points"
   Write-HtmliLink -ReturnTOC -File $FilePath
   #endregion enumerating Software Update Points and Configuration
   #region enumerating client push settings
-    Write-Verbose "$(Get-Date):   Enumerating Client Push Settings for Site"
+    Write-ProgressEx -CurrentOperation "Enumerating Client Push Settings for Site"
     Write-HTMLHeading -Text "Client Push Settings for Site $($CMSite.SiteCode)" -Level 2 -PageBreak -File $FilePath
-    Write-HTMLParagraph -Text "Client push allows SCCM to install the client to computers in the domain directly from SCCM using admin credentials on the remote computer.  This is <a href=`"https://docs.microsoft.com/en-us/sccm/core/clients/deploy/plan/client-installation-methods`" target=`"_blank`">one of several</a> ways to install the SCCM client on computers." -Level 3 -File $FilePath
+    Write-HTMLParagraph -Text "Client push allows CM to install the client to computers in the domain directly from CM using admin credentials on the remote computer.  This is <a href=`"https://docs.microsoft.com/en-us/sccm/core/clients/deploy/plan/client-installation-methods`" target=`"_blank`">one of several</a> ways to install the CM client on computers." -Level 3 -File $FilePath
     #Client push settings are found in WMI.  They are all in the list of global properties: SMS_DISCOVERY_DATA_MANAGER
-    $CPProps = (Get-WmiObject -Namespace ROOT\SMS\site_$($CMSite.SiteCode) -ComputerName $SMSProvider -Query "SELECT * FROM SMS_SCI_SCProperty where ItemType='SMS_DISCOVERY_DATA_MANAGER'")|select PropertyName,Value,Value1,Value2
-    If(($CPProps|Where{$_.PropertyName -eq 'SETTINGS'}).Value1 -eq 'Active'){
+    $CPProps = (Get-WmiObject -Namespace ROOT\SMS\site_$($CMSite.SiteCode) -ComputerName $SMSProvider -Query "SELECT * FROM SMS_SCI_SCProperty where ItemType='SMS_DISCOVERY_DATA_MANAGER'")|Select-Object PropertyName,Value,Value1,Value2
+    If(($CPProps | Where-Object {$_.PropertyName -eq 'SETTINGS'}).Value1 -eq 'Active'){
         Write-HTMLParagraph -Level 3 -Text "Automatic site-wide client push is enabled with the below settings." -File $FilePath
     }else{
         Write-HTMLParagraph -Level 3 -Text "Automatic site-wide client push is NOT enabled." -File $FilePath
@@ -2300,7 +3475,7 @@ if ($ListAllInformation){
     $InstallClientsDisabled = @()
 
     #FILTERS Property has the following known values.  Evaluating in a Switch: 0=install on all systems; 1=Do not Install Workstations; 2=Do not install on DCs; 4=Do not install servers; 5=Do not install on servers and workstations 7=Do not install servers, workstations or DCs
-    Switch(($CPProps|Where{$_.PropertyName -eq 'FILTERS'}).Value){
+    Switch(($CPProps | Where-Object {$_.PropertyName -eq 'FILTERS'}).Value){
         0{
             $InstallClientsEnabled += "Servers"
             $InstallClientsEnabled += "Workstations"
@@ -2337,7 +3512,7 @@ if ($ListAllInformation){
         }
     }
     #AutoInstallSiteSystem: 1=Enabled on Site system servers; 0=Disable install on site system servers
-    switch(($CPProps|Where{$_.PropertyName -eq 'AutoInstallSiteSystem'}).Value){
+    switch(($CPProps|Where-Object {$_.PropertyName -eq 'AutoInstallSiteSystem'}).Value){
         1{$InstallClientsEnabled +="Configuration Manager site system servers"}
         0{$InstallClientsDisabled +="Configuration Manager site system servers"}
     }
@@ -2355,7 +3530,7 @@ if ($ListAllInformation){
         Write-HtmlList -Title "Domain Controller Client Install Behavior" -InputObject $DCBehavior -Level 4 -File $FilePath
     }
     $CPSettings = Get-CMClientPushInstallation
-    $CPAccounts=($CPSettings.PropLists|where {$_.PropertyListName -eq 'Reserved2'}).values
+    $CPAccounts=($CPSettings.PropLists|Where-Object {$_.PropertyListName -eq 'Reserved2'}).values
     $CPAccountsDescription="Even if client push is not enabled on the site, client push accounts are important/required for installing and reinstalling clients from the console."
     If(-not [string]::IsNullOrEmpty($CPAccounts)){
         if ($MaskAccounts){
@@ -2366,36 +3541,200 @@ if ($ListAllInformation){
     }else{
         Write-HtmlList -Title "Defined Client Push Accounts" -Description $CPAccountsDescription -InputObject "None defined" -Level 4 -File $FilePath
     }
-    $InstallProps=($CPSettings.props|where {$_.PropertyName -eq 'Advanced Client Command Line'}).Value1
+    $InstallProps=($CPSettings.props|Where-Object {$_.PropertyName -eq 'Advanced Client Command Line'}).Value1
     If(-not [string]::IsNullOrEmpty($InstallProps)){
         Write-HtmlList -Title "Client Push MSI Installation Properties" -InputObject $InstallProps -Level 4 -File $FilePath
     }else{
         Write-HtmlList -Title "Client Push MSI Installation Properties" -InputObject "None defined" -Level 4 -File $FilePath
     }
-    Write-Verbose "$(Get-Date):   Completed Enumeration of Client Push Settings for Site"
+    Write-ProgressEx -CurrentOperation "Completed Enumeration of Client Push Settings for Site"
     Write-HtmliLink -ReturnTOC -File $FilePath
   #endregion enumerating client push settings
-  Write-Verbose "$(Get-Date):   Completed checking site configuration for $($CMSite.SiteCode)"
+  Write-ProgressEx -CurrentOperation "Completed checking site configuration for $($CMSite.SiteCode)"
 }
-Write-Verbose "$(Get-Date):   Completed Checking each site's configuration."
+Write-ProgressEx -CurrentOperation "Completed Checking each site's configuration."
 #endregion Site Configuration report
 
 
 ##### Hierarchy wide configuration
+$Progress = @{'Activity'="$Title started $($ScriptStartTime.ToShortTimeString())"; 'Status'='Hierarchy Wide Configuration'}
+
+
 Write-HTMLHeading -Level 1 -PageBreak -Text "Summary of Hierarchy Wide Configuration" -File $FilePath
 
+#region Discovery Methods
+Write-ProgressEx -CurrentOperation "Enumerating all Discovery Methods"
+Write-HTMLHeading -Level 2 -Text "Discovery Methods" -File $FilePath
+Write-ProgressEx -CurrentOperation "Enumerating AD Forest Discovery Method" -Activity 'Discovery Method' -Status 'Collecting settings' -Id 4
+Write-HTMLHeading -Level 3 -Text "Active Directory Forest Discovery" -ExcludeTOC -File $FilePath
+$DMADFD = Get-PWCMDiscoveryMethod -SiteServer $SMSProvider -SiteName $SiteCode -DiscoveryMethod ActiveDirectoryForestDiscovery
+if ($DMADFD.DiscoveryState -eq "Enabled") {
+$ForestDiscoverySettings = @()
+$ForestDiscoverySettings += "Synchronization Schedule: $($DMADFD.SyncSchedule)"
+$ForestDiscoverySettings += "Automatically Create Active Directory Site boundaries: $($DMADFD.ADSiteBoundaryCreation)"
+$ForestDiscoverySettings += "Automatically IP address range boundaries for IP subnets: $($DMADFD.SubnetBoundaryCreation)"
+Write-HtmlList -Description "Active Directory Forest Discovery is currently enabled with the following settings:" -InputObject $ForestDiscoverySettings -Level 3 -File $FilePath
+} else {
+    Write-HTMLParagraph -Text "Active Directory Forest Discovery is currently disabled." -Level 3 -File $FilePath
+}
+
+Write-ProgressEx -CurrentOperation "Enumerating AD Group Discovery Method" -Activity 'Discovery Method' -Status 'Collecting settings' -Id 4
+Write-HTMLHeading -Level 3 -Text "Active Directory Group Discovery" -ExcludeTOC -File $FilePath
+$DMADGD = Get-PWCMDiscoveryMethod -SiteServer $SMSProvider -SiteName $SiteCode -DiscoveryMethod ActiveDirectoryGroupDiscovery
+if ($DMADGD.DiscoveryState -eq "Enabled") {
+    $GroupDiscoverySettings = @()
+    $GroupDiscoverySettings += "Full discovery schedule: $($DMADGD.FullSyncSchedule)"
+    If ($DMADGD.IncrementalSyncState -eq "Enabled"){
+        $GroupDiscoverySettings += "Delta discovery schedule: $($DMADGD.IncrementalSyncSchedule)"
+    } else {
+        $GroupDiscoverySettings += "Delta discovery schedule: Disabled"
+    }
+    If ($DMADGD.FilterExpiredLogonState -eq "Enabled"){
+        $GroupDiscoverySettings += "Only discover computers that have logged on to the domain in a given period of time: Enabled"
+        $GroupDiscoverySettings += "Time since last logon (days): $($DMADGD.FilterExpiredLogonTime)"
+    } else {
+        $GroupDiscoverySettings += "Only discover computers that have logged on to the domain in a given period of time: Disabled"
+    }
+    If ($DMADGD.FilterExpiredPasswordState -eq "Enabled"){
+        $GroupDiscoverySettings += "Only discover computers that have updated their computer account password: Enabled"
+        $GroupDiscoverySettings += "Time since last password update (days): $($DMADGD.FilterExpiredPasswordTime)"
+    } else {
+        $GroupDiscoverySettings += "Only discover computers that have updated their computer account password: Disabled"
+    }
+    If ($DMADGD.DistributionGroupDiscoveryState -eq "Enabled"){
+        $GroupDiscoverySettings += "Discover the membership of distribution groups: Enabled"
+    } else {
+        $GroupDiscoverySettings += "Discover the membership of distribution groups: Disabled"
+    }
+    $GroupDiscoverySettings += "Search Locations:"
+    Write-HtmlList -Description "Active Directory Group Discovery is currently enabled with the following settings:" -InputObject $GroupDiscoverySettings -Level 3 -File $FilePath
+    Write-HtmlTable -InputObject $DMADGD.SearchLocations -Level 4 -File $FilePath
+}else{
+    Write-HTMLParagraph -Text "Active Directory Group Discovery is currently disabled." -Level 3 -File $FilePath
+}
+
+Write-ProgressEx -CurrentOperation "Enumerating AD System Discovery Method" -Activity 'Discovery Method' -Status 'Collecting settings' -Id 4
+Write-HTMLHeading -Level 3 -Text "Active Directory System Discovery" -ExcludeTOC -File $FilePath
+$DMADSD = Get-PWCMDiscoveryMethod -SiteServer $SMSProvider -SiteName $SiteCode -DiscoveryMethod ActiveDirectorySystemDiscovery
+if ($DMADSD.DiscoveryState -eq "Enabled") {
+    $SystemDiscoverySettings = @()
+    $SystemDiscoverySettings += "Full discovery schedule: $($DMADSD.FullSyncSchedule)"
+    If ($DMADSD.IncrementalSync -eq "Enabled"){
+        $SystemDiscoverySettings += "Delta discovery schedule: $($DMADSD.IncrementalSyncSchedule)"
+    } else {
+        $SystemDiscoverySettings += "Delta discovery schedule: Disabled"
+    }
+    If ($DMADSD.FilterExpiredLogon -eq "Enabled"){
+        $SystemDiscoverySettings += "Only discover computers that have logged on to the domain in a given period of time: Enabled"
+        $SystemDiscoverySettings += "Time since last logon (days): $($DMADSD.FilterExpiredLogonTime)"
+    } else {
+        $SystemDiscoverySettings += "Only discover computers that have logged on to the domain in a given period of time: Disabled"
+    }
+    If ($DMADSD.FilterExpiredPassword -eq "Enabled"){
+        $SystemDiscoverySettings += "Only discover computers that have updated their computer account password: Enabled"
+        $SystemDiscoverySettings += "Time since last password update (days): $($DMADSD.FilterExpiredPasswordTime)"
+    } else {
+        $SystemDiscoverySettings += "Only discover computers that have updated their computer account password: Disabled"
+    }
+    $SystemDiscoverySettings += "Search Containers:"
+    Write-HtmlList -Description "Active Directory System Discovery is currently enabled with the following settings:" -InputObject $SystemDiscoverySettings -Level 3 -File $FilePath
+    Write-HtmlTable -InputObject $DMADSD.ActiveDirectoryContainers -Level 4 -File $FilePath
+    Write-HtmlList -Description "The following addtional attributes are synced from AD:" -InputObject $DMADSD.ActiveDirectoryAttributes -Level 3 -File $FilePath
+}else{
+    Write-HTMLParagraph -Text "Active Directory System Discovery is currently disabled." -Level 3 -File $FilePath
+}
+
+Write-ProgressEx -CurrentOperation "Enumerating AD User Discovery Method" -Activity 'Discovery Method' -Status 'Collecting settings' -Id 4
+Write-HTMLHeading -Level 3 -Text "Active Directory User Discovery" -ExcludeTOC -File $FilePath
+$DMADUD = Get-PWCMDiscoveryMethod -SiteServer $SMSProvider -SiteName $SiteCode -DiscoveryMethod ActiveDirectoryUserDiscovery
+if ($DMADUD.DiscoveryState -eq "Enabled") {
+    $UserDiscoverySettings = @()
+    $UserDiscoverySettings += "Full discovery schedule: $($DMADUD.FullSyncSchedule)"
+    If ($DMADUD.IncrementalSync -eq "Enabled"){
+        $UserDiscoverySettings += "Delta discovery schedule (minutes): $($DMADUD.IncrementalSyncSchedule)"
+    } else {
+        $UserDiscoverySettings += "Delta discovery schedule: Disabled"
+    }
+    $UserDiscoverySettings += "Search Containers:"
+    Write-HtmlList -Description "Active Directory System Discovery is currently enabled with the following settings:" -InputObject $UserDiscoverySettings -Level 3 -File $FilePath
+    Write-HtmlTable -InputObject $DMADUD.ActiveDirectoryContainers -Level 4 -File $FilePath
+    Write-HtmlList -Description "The following addtional attributes are synced from AD:" -InputObject $DMADUD.ActiveDirectoryAttributes -Level 3 -File $FilePath
+}else{
+    Write-HTMLParagraph -Text "Active Directory System Discovery is currently disabled." -Level 3 -File $FilePath
+}
+
+Write-ProgressEx -CurrentOperation "Enumerating Network Discovery Method" -Activity 'Discovery Method' -Status 'Collecting settings' -Id 4
+Write-HTMLHeading -Level 3 -Text "Network Discovery" -ExcludeTOC -File $FilePath
+$DMND = Get-PWCMDiscoveryMethod -SiteServer $SMSProvider -SiteName $SiteCode -DiscoveryMethod NetworkDiscovery
+if ($DMND.DiscoveryState -eq "Enabled") {
+    $NetworkDiscoverySettings = @()
+    $NetworkDiscoverySettings += "Type of discover: $($DMND.DiscoveryType)"
+    $NetworkDiscoverySettings += "Slow networks: $($DMND.SlowNetwork)"
+if (($DMND.SearchSubnets).count -gt 0){
+    $NetworkDiscoverySettings += "Search Subnets:<br />$(Write-HtmlTable -InputObject $DMND.SearchSubnets)"
+} else {
+    $NetworkDiscoverySettings += "Search Subnets: None defined"
+}
+    $NetworkDiscoverySettings += "Include local subnets: $($DMND.IncludeLocalSubnets)"
+    if (($DMND.SearchDomains).count -gt 0){
+        $NetworkDiscoverySettings += "Search Domains:<br />$(Write-HtmlTable -InputObject $DMND.SearchDomains)"
+    } else {
+        $NetworkDiscoverySettings += "Search Domains: None defined"
+    }
+    $NetworkDiscoverySettings += "Search local domain: $($DMND.IncludeLocalDomain)"
+    If (($DMND.SearchSNMPCommunities).count -gt 0){
+        $NetworkDiscoverySettings += Write-HtmlList -Description "SNMP Communities:" -InputObject $DMND.SearchSNMPCommunities
+    } else {
+        $NetworkDiscoverySettings += "SNMP Communities: None defined"
+    }
+    $NetworkDiscoverySettings += "Maximum hops: $($DMND.SNMPMaxHopCount)"
+    If (($DMND.SearchSNMPDevices).count -gt 0){
+        $NetworkDiscoverySettings += Write-HtmlList -Description "SNMP Devices:" -InputObject $DMND.SearchSNMPDevices
+    } else {
+        $NetworkDiscoverySettings += "SNMP Devices: None defined"
+    }
+    If (($DMND.SearchDHCPServers).count -gt 0){
+        $NetworkDiscoverySettings += Write-HtmlList -Description "DHCP Servers:" -InputObject $DMND.SearchDHCPServers
+    } else {
+        $NetworkDiscoverySettings += "DHCP Servers: None defined"
+    }
+    $NetworkDiscoverySettings += "Include Site Server DHCP server: $($DMND.IncludeLocalDHCP)"
+    If (($DMND.DiscoverySchedule).count -gt 0) {
+        $NetworkDiscoverySettings += Write-HtmlList -Description "Discovery Schedules:" -InputObject $DMND.DiscoverySchedule
+    } else {
+        $NetworkDiscoverySettings += "Discovery Schedules: None specified"
+    }
+    Write-HtmlList -Description "Network Discovery is currently enabled with the following settings:" -InputObject $NetworkDiscoverySettings -Level 3 -File $FilePath
+}else{
+    Write-HTMLParagraph -Text "Network Discovery is currently disabled." -Level 3 -File $FilePath
+}
+
+Write-ProgressEx -CurrentOperation "Enumerating Heartbeat Discovery Method" -Activity 'Discovery Method' -Status 'Collecting settings' -Id 4
+Write-HTMLHeading -Level 3 -Text "Heartbeat Discovery" -ExcludeTOC -File $FilePath
+$DMHD = Get-PWCMDiscoveryMethod -SiteServer $SMSProvider -SiteName $SiteCode -DiscoveryMethod HeartbeatDiscovery
+if ($DMHD.DiscoveryState -eq "Enabled") {
+    $HBDiscoverySettings = @()
+    $HBDiscoverySettings += "Heartbeat schedule, send every: $($DMHD.DDRRefreshInterval)"
+    Write-HtmlList -Description "Heartbeat Discovery is currently enabled with the following settings:" -InputObject $HBDiscoverySettings -Level 3 -File $FilePath
+}else{
+    Write-HTMLParagraph -Text "Heartbeat Discovery is currently disabled." -Level 3 -File $FilePath
+}
+Write-ProgressEx -CurrentOperation "Completed Discovery Methods" -Activity 'Discovery Method' -Status 'Completed' -Id 4 -Completed
+Write-ProgressEx -CurrentOperation "Completed Enumerating all Discovery Methods"
+#endregion Discovery Methods
+
 #region enumerating Boundaries
-Write-Verbose "$(Get-Date): Enumerating all Site Boundaries"
+Write-ProgressEx -CurrentOperation "Enumerating and Sorting Site Boundaries"
 Write-HTMLHeading -Level 2 -Text "Summary of Site Boundaries" -File $FilePath
+
+$SubnetBoundaryTable = @();
+$ADBoundaryTable = @();
+$IPv6BoundaryTable = @();
+$IPRangeTable = @();
 
 $Boundaries = Get-CMBoundary
     if (-not [string]::IsNullOrEmpty($Boundaries))
 {
-  $SubnetBoundaryTable = @();
-  $ADBoundaryTable = @();
-  $IPv6BoundaryTable = @();
-  $IPRangeTable = @();
-  
   ##Boundary Site Types: 0=IP Subnet; 1=AD Site; 2=IPv6 Prefix; 3=IP Address Range
   foreach ($Boundary in $Boundaries) {       
     if ($Boundary.BoundaryType -eq 0) {
@@ -2403,7 +3742,7 @@ $Boundaries = Get-CMBoundary
       $NamesOfBoundarySiteSystems = $Null
       if (-not [string]::IsNullOrEmpty($Boundary.SiteSystems))
       {
-        ForEach-Object -Begin {$BoundarySiteSystems= $Boundary.SiteSystems} -Process {$NamesOfBoundarySiteSystems += $BoundarySiteSystems.split(',')} -End {$NamesOfBoundarySiteSystems} | Out-Null
+        ForEach-Object -Begin {$BoundarySiteSystems = $Boundary.SiteSystems} -Process {$NamesOfBoundarySiteSystems += $BoundarySiteSystems.split(',')} -End {$NamesOfBoundarySiteSystems} | Out-Null
       }
       else 
       {
@@ -2422,7 +3761,7 @@ $Boundaries = Get-CMBoundary
       $NamesOfBoundarySiteSystems = $Null
       if (-not [string]::IsNullOrEmpty($Boundary.SiteSystems))
       {
-        ForEach-Object -Begin {$BoundarySiteSystems= $Boundary.SiteSystems} -Process {$NamesOfBoundarySiteSystems += $BoundarySiteSystems.split(',')} -End {$NamesOfBoundarySiteSystems} | Out-Null
+        ForEach-Object -Begin {$BoundarySiteSystems = $Boundary.SiteSystems} -Process {$NamesOfBoundarySiteSystems += $BoundarySiteSystems.split(',')} -End {$NamesOfBoundarySiteSystems} | Out-Null
       }
       else 
       {
@@ -2441,7 +3780,7 @@ $Boundaries = Get-CMBoundary
       $NamesOfBoundarySiteSystems = $Null
       if (-not [string]::IsNullOrEmpty($Boundary.SiteSystems))
       {
-        ForEach-Object -Begin {$BoundarySiteSystems= $Boundary.SiteSystems} -Process {$NamesOfBoundarySiteSystems += $BoundarySiteSystems.split(',')} -End {$NamesOfBoundarySiteSystems} | Out-Null
+        ForEach-Object -Begin {$BoundarySiteSystems = $Boundary.SiteSystems} -Process {$NamesOfBoundarySiteSystems += $BoundarySiteSystems.split(',')} -End {$NamesOfBoundarySiteSystems} | Out-Null
       }
       else 
       {
@@ -2477,11 +3816,13 @@ $Boundaries = Get-CMBoundary
     }
   }
 }
+Write-ProgressEx -CurrentOperation "Boundaries Collected and sorted. Writing to report"
 
 #region IPv6 Boundaries Table
+      Write-ProgressEx -CurrentOperation "Writing [$($IPv6BoundaryTable.count)] IPv6 boundaries"
       Write-HTMLHeading -Level 3 -Text "IPv6 Boundaries" -File $FilePath
       If ($IPv6BoundaryTable){
-          $IPv6BoundaryTable = $IPv6BoundaryTable|select @{Name='Name';Expression={$_.Value}},'Description','Boundary Type','Default Site Code','Associated Site Systems'
+          $IPv6BoundaryTable = $IPv6BoundaryTable|Select-Object @{Name='Name';Expression={$_.Value}},'Description','Boundary Type','Default Site Code','Associated Site Systems'
           Write-HtmlTable -InputObject $IPv6BoundaryTable -Level 3 -Border 1 -File $FilePath
       } Else {
           Write-HTMLParagraph -Text "No IPv6 boundaries defined." -Level 3 -File $FilePath
@@ -2490,9 +3831,10 @@ $Boundaries = Get-CMBoundary
       Write-HTMLParagraph -Text '&nbsp;' -File $FilePath
 
 #region IP Subnet Boundaries Table
+      Write-ProgressEx -CurrentOperation "Writing [$($SubnetBoundaryTable.count)] subnet boundaries"
       Write-HTMLHeading -Level 3 -Text "IP Subnet Boundaries" -File $FilePath
       If ($SubnetBoundaryTable){
-          $SubnetBoundaryTable = $SubnetBoundaryTable|select @{Name='Name';Expression={$_.Value}},'Description','Boundary Type','Default Site Code','Associated Site Systems'
+          $SubnetBoundaryTable = $SubnetBoundaryTable|Select-Object @{Name='Name';Expression={$_.Value}},'Description','Boundary Type','Default Site Code','Associated Site Systems'
           Write-HtmlTable -InputObject $SubnetBoundaryTable -Level 3 -Border 1 -File $FilePath
       } Else {
           Write-HTMLParagraph -Text "No IP subnet boundaries defined." -Level 3 -File $FilePath
@@ -2501,9 +3843,10 @@ $Boundaries = Get-CMBoundary
       Write-HTMLParagraph -Text '&nbsp;' -File $FilePath
 
 #region IP Range Boundaries Table
+      Write-ProgressEx -CurrentOperation "Writing [$($IPRangeTable.count)] IP range boundaries"
       Write-HTMLHeading -Level 3 -Text "IP Range Boundaries" -File $FilePath
       If ($IPRangeTable){
-          $IPRangeTable = $IPRangeTable|select @{Name='Name';Expression={$_.Value}},'Description','Boundary Type','Default Site Code','Associated Site Systems'
+          $IPRangeTable = $IPRangeTable|Select-Object @{Name='Name';Expression={$_.Value}},'Description','Boundary Type','Default Site Code','Associated Site Systems'
           Write-HtmlTable -InputObject $IPRangeTable -Level 3 -Border 1 -File $FilePath
       } Else {
           Write-HTMLParagraph -Text "No IP Range boundaries defined." -Level 3 -File $FilePath
@@ -2511,25 +3854,25 @@ $Boundaries = Get-CMBoundary
 #endregion IP Range Boundaries Table
 
 #region AD Site Boundaries Table
+      Write-ProgressEx -CurrentOperation "Writing [$($ADBoundaryTable.count)] AD Site boundaries"
       Write-HTMLHeading -Level 3 -Text "AD Site Boundaries" -File $FilePath
       If ($ADBoundaryTable){
-          $ADBoundaryTable = $ADBoundaryTable|select @{Name='Name';Expression={$_.Value}},'Description','Boundary Type','Default Site Code','Associated Site Systems'
+          $ADBoundaryTable = $ADBoundaryTable|Select-Object @{Name='Name';Expression={$_.Value}},'Description','Boundary Type','Default Site Code','Associated Site Systems'
           Write-HtmlTable -InputObject $ADBoundaryTable -Level 3 -Border 1 -File $FilePath
       } Else {
           Write-HTMLParagraph -Text "No AD Site boundaries defined." -Level 3 -File $FilePath
       }
 #endregion AD Site Boundaries Table
     Write-HtmliLink -ReturnTOC -File $FilePath
+    Write-ProgressEx -CurrentOperation "Completed Enumerating and Sorting Site Boundaries"
 #endregion enumerating Boundaries
 
-
 #region enumerating all Boundary Groups and their members
-
+Write-ProgressEx -CurrentOperation "Enumerating all Boundary Groups and their members"
 Write-HTMLHeading -Level 2 -Text "Site Boundary Groups" -PageBreak -File $FilePath
 
-#User Defined Boundary Groups
-Write-Verbose "$(Get-Date):   Enumerating all Boundary Groups and their members"
-
+#region User Defined Boundary Groups
+Write-ProgressEx -CurrentOperation "Enumerating user defined Boundary Groups"
 $BoundaryGroups = Get-CMBoundaryGroup
 Write-HTMLHeading -Level 3 -Text "User Defined Boundary Groups" -File $FilePath
 
@@ -2541,7 +3884,7 @@ if (-not [string]::IsNullOrEmpty($BoundaryGroups))
     $MemberNames = @();
     if ($BoundaryGroup.SiteSystemCount -gt 0)
     {
-        $CMSiteSystems = Get-WmiObject -Class SMS_BoundaryGroupSiteSystems -Namespace ROOT\SMS\site_$SiteCode -ComputerName $SMSProvider | Where {$_.GroupID -eq "$($BoundaryGroup.GroupID)"}
+        $CMSiteSystems = Get-WmiObject -Class SMS_BoundaryGroupSiteSystems -Namespace ROOT\SMS\site_$SiteCode -ComputerName $SMSProvider | Where-Object {$_.GroupID -eq "$($BoundaryGroup.GroupID)"}
         foreach($SS in $CMSiteSystems){
             $BGSystems +=[regex]::Match($SS.ServerNALPath,'\[\"Display=\\\\(.*)\\\"\]MSWNET').Groups[1].value
         }
@@ -2558,29 +3901,68 @@ if (-not [string]::IsNullOrEmpty($BoundaryGroups))
       {
         $MemberName = (Get-CMBoundary -Id $MemberID).Value
         $MemberNames += "$MemberName (ID: $MemberID)"
-        Write-Verbose "Member name: $($MemberName)"
+        Write-debug "Member name: $($MemberName)"
       }
     }
     else
     {
       $MemberNames += 'No associated boundaries'
-      Write-Verbose 'There are no boundaries associated with this Boundary Group.'
+      Write-debug 'There are no boundaries associated with this Boundary Group.'
     }
     $BoundaryMembers = $MemberNames -join "--CRLF--"
-    $BoundaryGroupRow = New-Object -TypeName psobject -Property @{Name = $BoundaryGroup.Name; Description = $BoundaryGroup.Description; 'Boundary Members' = "$BoundaryMembers"; 'Site Systems' = $BoundaryGroupSiteSystems};
+    $BGRs = @()
+    $BGRs += Get-CMBoundaryGroupRelationship -SourceGroupId $BoundaryGroup.GroupID
+    $FallBackRelationships = ""
+    if ($BGRs.count -gt 0){
+        Foreach ($BGR in $BGRs){
+            $BGName = "$($BGR.DestinationGroupName)"
+            if ($BGR.FallbackDP -eq -1){
+                $FallbackDP = "Never"
+            }else{
+                $FallbackDP = "$($BGR.FallbackDP) minutes"
+            }
+            if ($BGR.FallbackMP -eq -1){
+                $FallbackMP = "Never"
+            }else{
+                $FallbackMP = "$($BGR.FallbackMP) minutes"
+            }
+            if ($BGR.FallbackSUP -eq -1){
+                $FallbackSUP = "Never"
+            }else{
+                $FallbackSUP = "$($BGR.FallbackSUP) minutes"
+            }
+            $FallBackRelationships = "$($FallBackRelationships)--B----U--$BGName--/U----/B-- --CRLF--Fallback DP: $FallbackDP --CRLF--Fallback MP: $FallbackMP --CRLF--Fallback SUP: $FallbackSUP --CRLF--"
+        }
+    }
+    Switch($BoundaryGroup.Flags){
+        0{$BGOptions = "--CBOX-- Allow peer downloads in this Boundary Group.--CRLF----UNCBOX-- During peer downloads, only use peers within the same Subnet.--CRLF----UNCBOX-- Prefer DP over peers within same Subnet.--CRLF----UNCBOX-- Prefer cloud DP over DP."}
+        1{$BGOptions = "--UNCBOX-- Allow peer downloads in this Boundary Group.--CRLF----UNCBOX-- During peer downloads, only use peers within the same Subnet.--CRLF----UNCBOX-- Prefer DP over peers within same Subnet.--CRLF----UNCBOX-- Prefer cloud DP over DP."}
+        2{$BGOptions = "--CBOX-- Allow peer downloads in this Boundary Group.--CRLF----CBOX-- During peer downloads, only use peers within the same Subnet.--CRLF----UNCBOX-- Prefer DP over peers within same Subnet.--CRLF----UNCBOX-- Prefer cloud DP over DP."}
+        4{$BGOptions = "--CBOX-- Allow peer downloads in this Boundary Group.--CRLF----UNCBOX-- During peer downloads, only use peers within the same Subnet.--CRLF----CBOX-- Prefer DP over peers within same Subnet.--CRLF----UNCBOX-- Prefer cloud DP over DP."}
+        6{$BGOptions = "--CBOX-- Allow peer downloads in this Boundary Group.--CRLF----CBOX-- During peer downloads, only use peers within the same Subnet.--CRLF----CBOX-- Prefer DP over peers within same Subnet.--CRLF----UNCBOX-- Prefer cloud DP over DP."}
+        8{$BGOptions = "--CBOX-- Allow peer downloads in this Boundary Group.--CRLF----UNCBOX-- During peer downloads, only use peers within the same Subnet.--CRLF----UNCBOX-- Prefer DP over peers within same Subnet.--CRLF----CBOX-- Prefer cloud DP over DP."}
+        9{$BGOptions = "--UNCBOX-- Allow peer downloads in this Boundary Group.--CRLF----UNCBOX-- During peer downloads, only use peers within the same Subnet.--CRLF----UNCBOX-- Prefer DP over peers within same Subnet.--CRLF----CBOX-- Prefer cloud DP over DP."}
+        10{$BGOptions = "--CBOX-- Allow peer downloads in this Boundary Group.--CRLF----CBOX-- During peer downloads, only use peers within the same Subnet.--CRLF----UNCBOX-- Prefer DP over peers within same Subnet.--CRLF----CBOX-- Prefer cloud DP over DP."}
+        12{$BGOptions = "--CBOX-- Allow peer downloads in this Boundary Group.--CRLF----UNCBOX-- During peer downloads, only use peers within the same Subnet.--CRLF----CBOX-- Prefer DP over peers within same Subnet.--CRLF----CBOX-- Prefer cloud DP over DP."}
+        14{$BGOptions = "--CBOX-- Allow peer downloads in this Boundary Group.--CRLF----CBOX-- During peer downloads, only use peers within the same Subnet.--CRLF----CBOX-- Prefer DP over peers within same Subnet.--CRLF----CBOX-- Prefer cloud DP over DP."}
+        default{$BGOptions = "Unknown Options"}
+    }
+    $BoundaryGroupRow = New-Object -TypeName psobject -Property @{Name = $BoundaryGroup.Name; Description = $BoundaryGroup.Description; 'Assigned Site' = $BoundaryGroup.DefaultSiteCode; 'Boundary Members' = "$BoundaryMembers"; 'Site Systems' = $BoundaryGroupSiteSystems;'Fallback Relationships' = "$FallBackRelationships"; 'Options' = "$BGOptions"};
     $BoundaryGroupTable += $BoundaryGroupRow
   }
   
-  $BoundaryGroupTable = $BoundaryGroupTable|select 'Name','Description','Boundary Members','Site Systems'
+  $BoundaryGroupTable = $BoundaryGroupTable|Select-Object 'Name','Description','Assigned Site','Boundary Members','Site Systems','Fallback Relationships','Options'
   Write-HtmlTable -InputObject $BoundaryGroupTable -Level 4 -Border 1 -File $FilePath
 }
 else
 {
   Write-HTMLParagraph -Level 3 -Text "There are no Boundary Groups configured. It is mandatory to configure a Boundary Group for Configuration Manger to work properly." -File $FilePath
 }
-#End User Defined Boundary Groups
+Write-ProgressEx -CurrentOperation "Completed user defined Boundary Groups"
+#endregion User Defined Boundary Groups
 
-#Default Boundary Group
+#region Default Boundary Group
+Write-ProgressEx -CurrentOperation "Enumerating Default Boundary Group"
 Write-HTMLHeading -Level 3 -Text "Default Boundary Group" -File $FilePath
 
 $DefaultBG = Get-CMDefaultBoundaryGroup
@@ -2588,7 +3970,7 @@ $DefaultBGID = $DefaultBG.GroupID
 $BGSystems = @()
 if ($DefaultBG.SiteSystemCount -gt 0)
 {
-    $CMSiteSystems = Get-WmiObject -Class SMS_BoundaryGroupSiteSystems -Namespace ROOT\SMS\site_$SiteCode -ComputerName $SMSProvider | Where {$_.GroupID -eq "$DefaultBGID"}
+    $CMSiteSystems = Get-WmiObject -Class SMS_BoundaryGroupSiteSystems -Namespace ROOT\SMS\site_$SiteCode -ComputerName $SMSProvider | Where-Object {$_.GroupID -eq "$DefaultBGID"}
     foreach($SS in $CMSiteSystems){
         $BGSystems +=[regex]::Match($SS.ServerNALPath,'\[\"Display=\\\\(.*)\\\"\]MSWNET').Groups[1].value
     }
@@ -2598,24 +3980,25 @@ Else
 {
     $BoundaryGroupSiteSystems = "None"
 }
-$DefaultBGRelationship = Get-WmiObject -Class SMS_BoundaryGroupRelationships -Namespace ROOT\SMS\site_$SiteCode -ComputerName $SMSProvider | Where {($_.SourceGroupID -eq "$DefaultBGID") -and ($_.DestinationGroupID -eq "$DefaultBGID")}
+$DefaultBGRelationship = Get-WmiObject -Class SMS_BoundaryGroupRelationships -Namespace ROOT\SMS\site_$SiteCode -ComputerName $SMSProvider | Where-Object {($_.SourceGroupID -eq "$DefaultBGID") -and ($_.DestinationGroupID -eq "$DefaultBGID")}
 $FallbackSUP = $DefaultBGRelationship.FallbackSUP
 $FallbackDP = $DefaultBGRelationship.FallbackDP
-IF ($FallbackSUP -eq -1) {$FallbackSUP = "Never"}else{$FallbackSUP = "$FallbackSUP mins"}
-IF ($FallbackDP -eq -1) {$FallbackDP = "Never"}else{$FallbackDP = "$FallbackDP mins"}
+$FallbackMP = $DefaultBGRelationship.FallbackMP
+IF (($FallbackSUP -eq -1) -or ($FallbackSUP -eq 0)) {$FallbackSUP = "Never"}else{$FallbackSUP = "$FallbackSUP mins"}
+IF (($FallbackDP -eq -1) -or ($FallbackDP -eq 0)) {$FallbackDP = "Never"}else{$FallbackDP = "$FallbackDP mins"}
+IF (($FallbackMP -eq -1) -or ($FallbackMP -eq 0)) {$FallbackMP = "Never"}else{$FallbackMP = "$FallbackMP mins"}
 
-
-$DefaultBoundaryGroupRow = New-Object -TypeName psobject -Property @{Name = $DefaultBG.Name; 'Site Systems' = $BoundaryGroupSiteSystems; 'DP Fallback Time' = $FallbackDP; 'SUP Fallback Time' = $FallbackSUP};
-$DefaultBoundaryGroupRow = $DefaultBoundaryGroupRow|select 'Name','Site Systems','DP Fallback Time','SUP Fallback Time'
+$DefaultBoundaryGroupRow = New-Object -TypeName psobject -Property @{Name = $DefaultBG.Name; 'Site Systems' = $BoundaryGroupSiteSystems; 'DP Fallback Time' = $FallbackDP; 'SUP Fallback Time' = $FallbackSUP; 'MP Fallback Time' = $FallbackMP};
+$DefaultBoundaryGroupRow = $DefaultBoundaryGroupRow|Select-Object 'Name','Site Systems','DP Fallback Time','SUP Fallback Time','MP Fallback Time'
 Write-HtmlTable -InputObject $DefaultBoundaryGroupRow -Level 4 -Border 1 -File $FilePath
 
-#End Default Boundary Group
+Write-ProgressEx -CurrentOperation "Completed Enumerating Default Boundary Group"
+#endregion Default Boundary Group
 Write-HtmliLink -ReturnTOC -File $FilePath
 #endregion enumerating all Boundary Groups and their members
 
-
 #region enumerating Client Policies
-Write-Verbose "$(Get-Date):   Enumerating all Client/Device Settings"
+Write-ProgressEx -CurrentOperation "Enumerating all Client Settings"
 Write-HTMLHeading -Level 2 -PageBreak -Text 'Summary of Custom Client Device Settings' -File $FilePath
 
 $AllClientSettings = Get-CMClientSetting | Where-Object -FilterScript {$_.SettingsID -ne '0'}
@@ -2623,6 +4006,7 @@ $AllClientSettings = Get-CMClientSetting | Where-Object -FilterScript {$_.Settin
 If ($ListAllInformation){
     foreach ($ClientSetting in $AllClientSettings)
     {
+      Write-ProgressEx -CurrentOperation "Client Setting: $($ClientSetting.Name)" -Activity 'Client Settings' -Status 'Collecting detailed settings' -Id 5
       $SettingInfo = @()
       $SettingInfo += "Client Settings Description: $($ClientSetting.Description)"
       $SettingInfo += "Client Settings ID: $($ClientSetting.SettingsID)"
@@ -2939,6 +4323,20 @@ If ($ListAllInformation){
             5{
             #AgentID 5 is for Network Access Protection (NAP) and is no longer part of the product.
             }
+            6{
+                $KnownProps = @("CacheTombstoneContentMinDuration")
+                #CacheTombstoneContentMinDuration : 93300 Seconds -- Minimum duration before the client can remove cached content (minutes):
+                If ($UnknownClientSettings) {
+                    $UnknownProps = @()
+                    $props = ($AgentConfig| Get-Member -Type Property).Name
+                    Foreach ($prop in $props) {
+                      if ($prop -notin $KnownProps) {$UnknownProps += "Property Name: $Prop -- Assigned Value: $($AgentConfig.$prop)"}
+                    }
+                    If ($UnknownProps -gt 0) {
+                      Write-HtmlList -InputObject $UnknownProps -Description "Unknown Properties:" -Level 3 -File $FilePath
+                    }
+                }  
+            }
             8{
               $KnownProps = @("AgentID","DataCollectionSchedule","Enabled","LastUpdateTimeOfRules","MaximumUsageInstancesPerReport","MeterRuleIDList","MRUAgeLimitInDays","MRURefreshInMinutes","PSComputerName","PSShowComputerName","ReportTimeout","SmsProviderObjectPath")
               $Config = 'Software Metering'
@@ -2998,7 +4396,7 @@ If ($ListAllInformation){
               }
             }
             9{
-              $KnownProps = @("AgentID","AlternateContentProviders","AssignmentBatchingTimeout","BrandingSubTitle","BrandingTitle","ContentDownloadTimeout","ContentLocationTimeout","DayReminderInterval","Enabled","EnableExpressUpdates","EvaluationSchedule","ExpressUpdatesPort","HourReminderInterval","MaxRandomDelayMinutes","MaxScanRetryCount","O365Management","PerDPInactivityTimeout","PSComputerName","PSShowComputerName","ReminderInterval","ScanRetryDelay","ScanSchedule","SmsProviderObjectPath","TotalInactivityTimeout","UpdateStatusRefreshIntervalDays","UserExperience","UserJobPerDPInactivityTimeout","UserJobTotalInactivityTimeout","WSUSLocationTimeout","WSUSScanRetryCodes","WUAMaxRebootsWhenOnInternet","WUASuccessCodes","WUfBEnabled","EnableThirdPartyUpdates")
+              $KnownProps = @("AgentID","AlternateContentProviders","AssignmentBatchingTimeout","BrandingSubTitle","BrandingTitle","ContentDownloadTimeout","ContentLocationTimeout","DayReminderInterval","Enabled","EnableExpressUpdates","EvaluationSchedule","ExpressUpdatesPort","HourReminderInterval","MaxRandomDelayMinutes","MaxScanRetryCount","O365Management","PerDPInactivityTimeout","PSComputerName","PSShowComputerName","ReminderInterval","ScanRetryDelay","ScanSchedule","SmsProviderObjectPath","TotalInactivityTimeout","UpdateStatusRefreshIntervalDays","UserExperience","UserJobPerDPInactivityTimeout","UserJobTotalInactivityTimeout","WSUSLocationTimeout","WSUSScanRetryCodes","WUAMaxRebootsWhenOnInternet","WUASuccessCodes","WUfBEnabled","EnableThirdPartyUpdates","ServiceWindowManagement","NEOPriorityOption","DynamicUpdateOption")
               $Config = 'Software Updates'
               $ConfigList = @()
               $ConfigList += "Enable software updates on clients: $($AgentConfig.Enabled)"
@@ -3108,11 +4506,11 @@ If ($ListAllInformation){
               }
               if($AgentConfig.EnableExpressUpdates -eq $False)
               {
-                  $ConfigList += "Enable installation of Express installation files on clients: No"
+                  $ConfigList += "Allow clients to download delta content when available (Enable installation of Express installation files on clients - Before 1902): No"
               }
               else
               {
-                  $ConfigList += "Enable installation of Express installation files on clients: Yes"
+                  $ConfigList += "Allow clients to download delta content when available (Enable installation of Express installation files on clients - Before 1902): Yes"
                   $ConfigList += "Port used to download content for Express installation files: $($AgentConfig.ExpressUpdatesPort)"
               }
               If($AgentConfig.O365Management -eq 1)
@@ -3123,6 +4521,7 @@ If ($ListAllInformation){
               {
                   $ConfigList += "Enable management of the Office 365 Client Agent: No"
               }
+              <# No longer appears this is listed in the client settings....
               If($AgentConfig.EnableThirdPartyUpdates -eq "True")
               {
                   $ConfigList += "Enable Third Party Software Updates: Yes"
@@ -3130,7 +4529,24 @@ If ($ListAllInformation){
               else
               {
                   $ConfigList += "Enable Third Party Software Updates: No"
+              }  #>
+              If($AgentConfig.ServiceWindowManagement -eq "True"){
+                  $ConfigList += "Enable installation of software updates in `"All deployments`" maintenance windows when `"Software update`" maintenance window is available: Yes"
+              } else {
+                  $ConfigList += "Enable installation of software updates in `"All deployments`" maintenance windows when `"Software update`" maintenance window is available: No"
               }
+              switch ($AgentConfig.NEOPriorityOption) {
+                  0 { $ThreadPriority = 'Not Configured' }
+                  1 { $ThreadPriority = 'Normal' }
+                  2 { $ThreadPriority = 'Low' }
+              }
+              switch ($AgentConfig.DynamicUpdateOption) {
+                  0 { $DynamicUpdateOption = 'Not Configured' }
+                  1 { $DynamicUpdateOption = 'Yes' }
+                  2 { $DynamicUpdateOption = 'No' }
+              }
+              $ConfigList += "Specify thread priority for feature updates: $ThreadPriority"
+              $ConfigList += "Enable Dynamic Update for feature updates: $DynamicUpdateOption"
               Write-HtmlList -InputObject $ConfigList -Description "<b>$Config</b>" -Level 3 -File $FilePath
               If ($UnknownClientSettings) {
                   $UnknownProps = @()
@@ -3184,8 +4600,8 @@ If ($ListAllInformation){
               $Config = 'Background Intelligent Transfer'
               $ConfigList = @()
               $ConfigList += "Limit the maximum network bandwidth for BITS background transfers: $($AgentConfig.EnableBitsMaxBandwidth)"
-              $ConfigList += "Throttling window start time: $($AgentConfig.MaxBandwidthValidFrom)"
-              $ConfigList += "Throttling window end time: $($AgentConfig.MaxBandwidthValidTo)"
+              $ConfigList += "Throttling window start time (24hr): $($AgentConfig.MaxBandwidthValidFrom):00"
+              $ConfigList += "Throttling window end time (24hr): $($AgentConfig.MaxBandwidthValidTo):00"
               $ConfigList += "Maximum transfer rate during throttling window (kbps): $($AgentConfig.MaxTransferRateOnSchedule)"
               $ConfigList += "Allow BITS downloads outside the throttling window: $($AgentConfig.EnableDownloadOffSchedule)"
               $ConfigList += "Maximum transfer rate outside the throttling window (Kbps): $($AgentConfig.MaxTransferRateOffSchedule)"
@@ -3387,12 +4803,20 @@ If ($ListAllInformation){
               }
             }
             18{
-              $KnownProps = @("AgentID","AllowUserToOptOutFromPowerPlan","Enabled","EnableP2PWakeupSolution","EnableUserIdleMonitoring","EnableWakeupProxy","MaxCPU","MaxMachinesPerManager","MinimumServersNeeded","NumOfDaysToKeep","NumOfMonthsToKeep","Port","PSComputerName","PSShowComputerName","SmsProviderObjectPath","WakeupProxyDirectAccessPrefixList","WakeupProxyFirewallFlags","WolPort")
+              $KnownProps = @("AgentID","AllowUserToOptOutFromPowerPlan","Enabled","EnableP2PWakeupSolution","EnableUserIdleMonitoring","EnableWakeupProxy","MaxCPU","MaxMachinesPerManager","MinimumServersNeeded","NumOfDaysToKeep","NumOfMonthsToKeep","Port","PSComputerName","PSShowComputerName","SmsProviderObjectPath","WakeupProxyDirectAccessPrefixList","WakeupProxyFirewallFlags","WolPort","AllowWakeup")
               $Config = 'Power Management'
               $ConfigList = @()
               $ConfigList += "Allow power management of clients: $($AgentConfig.Enabled)"
               $ConfigList += "Allow users to exclude their device from power management: $($AgentConfig.AllowUserToOptOutFromPowerPlan)"
+              #AllowWakeup: 0 = Not Configured; 1 = Enabled; 2 = Disabled
+              switch ($AgentConfig.AllowWakeup) {
+                0 { $Wakeup = 'Not Configured' }
+                1 { $Wakeup = 'Enabled' }
+                2 { $Wakeup = 'Disabled' }
+              }
+              $ConfigList += "Allow network wake-up: $Wakeup"
               $ConfigList += "Enable wake-up proxy: $($AgentConfig.EnableWakeupProxy)"
+              $ConfigList += "Wake On LAN port number (UDP): $($AgentConfig.WolPort)"
               if ($AgentConfig.EnableWakeupProxy -eq 'True')
               {
                 $ConfigList += "Wake-up proxy port number (UDP): $($AgentConfig.Port)"
@@ -3434,7 +4858,7 @@ If ($ListAllInformation){
               $ConfigList = @()
               $ConfigList += "Manage Endpoint Protection client on client computers: $($AgentConfig.EnableEP)"
               $ConfigList += "Install Endpoint Protection client on client computers: $($AgentConfig.InstallSCEPClient)"
-              $ConfigList += "Automatically remove previously installed antimalware software before Endpoint Protection is installed: $($AgentConfig.Remove3rdParty)"
+              #$ConfigList += "Automatically remove previously installed antimalware software before Endpoint Protection is installed: $($AgentConfig.Remove3rdParty)"
               $ConfigList += "Allow Endpoint Protection client installation and restarts outside maintenance windows. Maintenance windows must be at least 30 minutes long for client installation: $($AgentConfig.OverrideMaintenanceWindow)"
               $ConfigList += "For Windows Embedded devices with write filters, commit Endpoint Protection client installation (requires restart): $($AgentConfig.PersistInstallation)"
               $ConfigList += "Suppress any required computer restarts after the Endpoint Protection client is installed: $($AgentConfig.SuppressReboot)"
@@ -3457,11 +4881,13 @@ If ($ListAllInformation){
               }
             }
             21{
-              $KnownProps = @("AgentID","PSComputerName","PSShowComputerName","RebootLogoffNotificationCountdownDuration","RebootLogoffNotificationFinalWindow","SmsProviderObjectPath")
+              $KnownProps = @("AgentID","PSComputerName","PSShowComputerName","RebootLogoffNotificationCountdownDuration","RebootLogoffNotificationFinalWindow","SmsProviderObjectPath","CountdownSnoozeInterval","RebootNotificationsDialog")
               $Config = 'Computer Restart'
               $ConfigList = @()
               $ConfigList += "Display a temporary notification to the user that indicates the interval before the user is logged of or the computer restarts (minutes): $($AgentConfig.RebootLogoffNotificationCountdownDuration)"
               $ConfigList += "Display a dialog box that the user cannot close, which displays the countdown interval before the user is logged of or the computer restarts (minutes): $([string]$AgentConfig.RebootLogoffNotificationFinalWindow / 60)"
+              $ConfigList += "Specify the snooze suration for computer restart countdown notifications (minutes): $($AgentConfig.CountdownSnoozeInterval)"
+              $ConfigList += "When a deployment requires a restart, show a dialog windows to the user instead of a toast notification: $($AgentConfig.RebootNotificationsDialog)"
               Write-HtmlList -InputObject $ConfigList -Description "<b>$Config</b>" -Level 3 -File $FilePath
               If ($UnknownClientSettings) {
                   $UnknownProps = @()
@@ -3529,10 +4955,15 @@ If ($ListAllInformation){
               $ConfigList += "Configure client cache size: $($AgentConfig.ConfigureCacheSize)"
               $ConfigList += "Maximum cache size (MB): $($AgentConfig.MaxCacheSizeMB)"
               $ConfigList += "Maximum cache size (percentage of disk): $($AgentConfig.MaxCacheSizePercent)"
-              $ConfigList += "Enable Configuration Manager client in full OS to share content: $($AgentConfig.CanBeSuperPeer)"
+              #Client Cache duration appears in AgentID 6.  But since in GUI under 'Client cache settings', we will loop the config to find agent 6 and get the setting here.
+              foreach ($AC in $ClientSetting.AgentConfigurations){
+                If ($AC.AgentID -eq 6) {
+                    $ConfigList += "Minimum duration before the client can remove cached content (minutes): $($AC.CacheTombstoneContentMinDuration/60)"
+                }
+              }
+              $ConfigList += "Enable as peer cache source (Enable Configuration Manager client in full OS to share content - 1902 and earlier): $($AgentConfig.CanBeSuperPeer)"
               $ConfigList += "Port for initial network broadcast: $($AgentConfig.BroadcastPort)"
-              $ConfigList += "Enable HTTPS for client peer communication: $($AgentConfig.HttpsEnabled)"
-              $ConfigList += "Port for content download from peer (HTTP/HTTPS): $($AgentConfig.HttpPort)"
+              $ConfigList += "Port for content download from peer: $($AgentConfig.HttpPort)"
               Write-HtmlList -InputObject $ConfigList -Description "<b>$Config</b>" -Level 3 -File $FilePath
               If ($UnknownClientSettings) {
                   $UnknownProps = @()
@@ -3620,7 +5051,12 @@ If ($ListAllInformation){
                   }else{
                       $ConfigList += "Hide installed applications in Software Center: Not Selected"
                   }
-                  $tabvisibility = "Select which tabs should be exposed to the end user in Software Center:<br />"
+                  if ($SCBrand.'application-catalog-link-hidden' -eq 'true'){
+                    $ConfigList += "Hide Application Catalog in Software Center: Selected"
+                }else{
+                    $ConfigList += "Hide Application Catalog in Software Center: Not Selected"
+                }
+                $tabvisibility = "Select which tabs should be exposed to the end user in Software Center:<br />"
                   foreach ($tab in $SCBrand.'tab-visibility'.tab){
                       switch ($tab.name)
                       {
@@ -3629,10 +5065,25 @@ If ($ListAllInformation){
                         'OSD' {$tabvisibility = $tabvisibility + " &bull;  Operating Systems: $($tab.visible) <br />"}
                         'InstallationStatus' {$tabvisibility = $tabvisibility + " &bull;  Installation Status: $($tab.visible) <br />"}
                         'Compliance' {$tabvisibility = $tabvisibility + " &bull;  Device Compliance: $($tab.visible) <br />"}
-                        'Options' {$tabvisibility = $tabvisibility + " &bull;  Applications: $($tab.visible) <br />"}
+                        'Options' {$tabvisibility = $tabvisibility + " &bull;  Options: $($tab.visible) <br />"}
                       }
                   }
+                  IF (-not [string]::IsNullOrEmpty($SCBrand.'custom-tab'.'custom-tab-name')){
+                    $tabvisibility = $tabvisibility + " &bull;  $($SCBrand.'custom-tab'.'custom-tab-name'): $($SCBrand.'custom-tab'.'custom-tab-content') <br />"
+                  }else{
+                    $tabvisibility = $tabvisibility + " &bull;  Custom Tab not defined. <br />"
+                  }
                   $ConfigList += $tabvisibility.TrimEnd('<br />')
+                  If (($SCBrand.'defaults-list'.'required-filter-default' -eq 'false') -or ($null -eq $SCBrand.'defaults-list'.'required-filter-default')){
+                    $ConfigList += 'Default application filter: All'
+                  }else{
+                    $ConfigList += 'Default application filter: Required'
+                  }
+                  if (($SCBrand.'defaults-list'.'list-view-default' -eq 'false') -or ($null -eq $SCBrand.'defaults-list'.'list-view-default')){
+                    $ConfigList += 'Default application view: Tile view'
+                  }else{
+                    $ConfigList += 'Default application view: List view'
+                  }
               }Else{
                   $ConfigList += "Select these new settings to specify company information: No"
               }
@@ -3649,7 +5100,7 @@ If ($ListAllInformation){
               }
             }
             32{
-              $KnownProps = @("AgentID","PSComputerName","PSShowComputerName","SmsProviderObjectPath","EnableWindowsDO")
+              $KnownProps = @("AgentID","PSComputerName","PSShowComputerName","SmsProviderObjectPath","EnableWindowsDO","StampDOINC")
               $Config = 'Delivery Optimization'
               $ConfigList = @()
               If ($AgentConfig.EnableWindowsDO -eq 'True'){
@@ -3658,6 +5109,7 @@ If ($ListAllInformation){
                 $WindowsDO = 'No'
               }
               $ConfigList += "Use Configuration Manager Boundary Groups for Delivery Optimization Group ID: $WindowsDO"
+              $ConfigList += "Enable devices managed by Configuration Manager to use Delivery Optimization In-Network Cacheeserver (Beta) for content download: $($AgentConfig.StampDOINC)"
               Write-HtmlList -InputObject $ConfigList -Description "<b>$Config</b>" -Level 3 -File $FilePath
               If ($UnknownClientSettings) {
                   $UnknownProps = @()
@@ -3674,13 +5126,14 @@ If ($ListAllInformation){
         }
         catch [System.Management.Automation.PropertyNotFoundException] 
         {
-          Write-Verbose "$(Get-Date):   Client Settings Property not found."
+          Write-Debug "$(Get-Date):   Client Settings Property not found."
         }
 
       }
     }
 }else{
     foreach ($ClientSetting in $AllClientSettings){
+      Write-ProgressEx -CurrentOperation "Client Setting: $($ClientSetting.Name)" -Activity 'Client Settings' -Status 'Collecting basic settings' -Id 5
       $SettingInfo = @()
       $SettingInfo += "Client Settings Description: $($ClientSetting.Description)"
       $SettingInfo += "Client Settings ID: $($ClientSetting.SettingsID)"
@@ -3710,12 +5163,15 @@ If ($ListAllInformation){
         }
     }
 }
+Write-ProgressEx -CurrentOperation "Client Setting: $($ClientSetting.Name)" -Activity 'Client Settings' -Status 'Collection Complete' -Id 5 -Completed
+
 Write-HtmliLink -ReturnTOC -File $FilePath
+Write-ProgressEx -CurrentOperation "Completed enumerating all Client Settings"
 #endregion enumerating Client Policies
 
 #region Security
 
-Write-Verbose "$(Get-Date):   Collecting all administrative users"
+Write-ProgressEx -CurrentOperation "Collecting all administrative users"
 Write-HTMLHeading -Level 2 -PageBreak -Text 'Administrative Users' -File $FilePath
 
 $Admins = Get-CMAdministrativeUser
@@ -3745,7 +5201,7 @@ Write-HtmlTable -InputObject $AdminArray -Border 1 -Level 3 -File $FilePath
 
 
 #region enumerating all custom Security roles
-Write-Verbose "$(Get-Date):   enumerating all custom build security roles"
+Write-ProgressEx -CurrentOperation "enumerating all custom build security roles"
 Write-HTMLHeading -Level 2 -Text 'Custom Security Roles' -File $FilePath
 $SecurityRoles = Get-CMSecurityRole | Where-Object -FilterScript {-not $_.IsBuiltIn}
 if (-not [string]::IsNullOrEmpty($SecurityRoles))
@@ -3778,7 +5234,7 @@ else
 
 #region System Used Accounts
 
-Write-Verbose "$(Get-Date):   Enumerating all used accounts"
+Write-ProgressEx -CurrentOperation "Enumerating all used accounts"
 Write-HTMLHeading -Level 2 -Text 'Configured Accounts' -File $FilePath
 $Accounts = Get-CMAccount
 Write-HTMLParagraph -Text 'List of all accounts used for specific tasks in the site:' -Level 2 -File $FilePath
@@ -3801,40 +5257,50 @@ If(-not [string]::IsNullOrEmpty($Accounts)){
     Write-HTMLParagraph -Text 'No accounts in use in this site.' -Level 3 -File $FilePath
 }
 #endregion System Used Accounts
+
 Write-HtmliLink -ReturnTOC -File $FilePath
+Write-ProgressEx -CurrentOperation "Done with Administration, next Assets and Compliance"
 
 ####
 #region Assets and Compliance
 ####
-Write-Verbose "$(Get-Date):   Done with Administration, next Assets and Compliance"
+$Progress = @{'Activity'="$Title started $($ScriptStartTime.ToShortTimeString())"; 'Status'='Assets and Compliance'}
+Write-ProgressEx
+
 Write-HTMLHeading -Level 1 -PageBreak -Text 'Assets and Compliance' -File $FilePath
 
 #region enumerating all User Collections
+Write-ProgressEx -CurrentOperation "Collecting User Collections"
 Write-HTMLHeading -Level 2 -Text 'Summary of User Collections' -File $FilePath
 $UserCollections = Get-CMUserCollection
-$BuiltinUserCollections = $UserCollections|where {$_.CollectionID -like "SMS*"}
-$CustomUserCollections = $UserCollections|where {$_.CollectionID -notlike "SMS*"}
+$BuiltinUserCollections = @()
+$CustomUserCollections = @()
+$BuiltinUserCollections = $UserCollections|Where-Object {$_.CollectionID -like "SMS*"}
+$CustomUserCollections = $UserCollections|Where-Object {$_.CollectionID -notlike "SMS*"}
 if ($ListAllInformation)
 {
-  $CustomUCArray = @();
   $BuiltInUCArray = @();
+  Write-ProgressEx -CurrentOperation "Built-In User Collections"
   Write-HTMLParagraph -Text "Configuration Manager comes with a few built-in user collections.  Any number of custom collections can be defined in the console.  Below is a summary of both types." -Level 2 -File $FilePath
   Write-HTMLHeading -Level 3 -Text 'Built-In User Collections' -File $FilePath
   Write-HTMLParagraph -Text "There are $($BuiltinUserCollections.count) built-in default user collections.  Their names and member counts are listed below:" -Level 3 -File $FilePath
   foreach ($UserCollection in $BuiltinUserCollections)
   {
-    Write-Verbose "$(Get-Date):   Found Built-in User Collection: $($UserCollection.Name)"
+    Write-ProgressEx -CurrentOperation "Built-in User Collection: $($UserCollection.Name)" -Activity 'Built-In User Collections' -Status 'Collecting details' -Id 6
     # Get collection folder (not visible from Get-CMUserCollection cmdlet)
     $CollectionFolder = (Get-WmiObject -Namespace "root\sms\site_$SiteCode" -Class "SMS_Collection" -Filter "CollectionId = '$($UserCollection.CollectionID)'" -ComputerName $SMSProvider).ObjectPath
-    $BuiltInUCArray += New-Object -TypeName psobject -Property @{'Collection Name' = $UserCollection.Name; 'Collection ID' = $UserCollection.CollectionID; 'Member Count' = $UserCollection.MemberCount; 'Folder' = "Root$CollectionFolder";};
+    $BuiltInUCArray += New-Object -TypeName psobject -Property @{'Collection Name' = $UserCollection.Name; 'Collection ID' = $UserCollection.CollectionID; 'Member Count' = $UserCollection.MemberCount; 'Schedule' = "$(Get-HumanReadableSchedule $UserCollection.RefreshSchedule)"; 'Folder' = "Root$CollectionFolder";};
   }
-  $BuiltInUCArray = $BuiltInUCArray | Select-Object -Property 'Collection Name','Collection ID','Member Count','Folder'
+  Write-ProgressEx -CurrentOperation "Completed Built-in User Collection" -Activity 'Built-In User Collections' -Status 'Collecting details' -Id 6 -Completed
+  $BuiltInUCArray = $BuiltInUCArray | Select-Object -Property 'Collection Name','Collection ID','Member Count','Schedule','Folder'
   Write-HtmlTable -InputObject $BuiltInUCArray -Border 1 -Level 4 -File $FilePath
+  Write-ProgressEx -CurrentOperation "Completed writing Built-in User Collection"
 
+  Write-ProgressEx -CurrentOperation "User Defined User Collections"
   Write-HTMLHeading -Level 3 -Text 'User Defined User Collections' -File $FilePath
   foreach ($UserCollection in $CustomUserCollections)
   {
-    Write-Verbose "$(Get-Date):   Found Custom User Collection: $($UserCollection.Name)"
+    Write-ProgressEx -CurrentOperation "Custom User Collection: $($UserCollection.Name)" -Activity 'User Defined User Collections' -Status 'Collecting details' -Id 7
     $CollectionInfo = @()
     $CollectionName = "$($UserCollection.Name)"
     # Get collection folder (not visible from Get-CMUserCollection cmdlet)
@@ -3867,25 +5333,25 @@ if ($ListAllInformation)
         $DirectRules = $UserCollection | Get-CMUserCollectionDirectMembershipRule -ErrorAction SilentlyContinue
     }
     catch [System.Management.Automation.PropertyNotFoundException] {
-        Write-Verbose "$(Get-Date):   Collection Direct Rule info not found"
+        Write-Debug "$(Get-Date):   Collection Direct Rule info not found"
     }
     try {
         $QueryRules = $UserCollection | Get-CMUserCollectionQueryMembershipRule -ErrorAction SilentlyContinue
     }
     catch [System.Management.Automation.PropertyNotFoundException] {
-        Write-Verbose "$(Get-Date):   Collection Query Rule info not found"
+        Write-Debug "$(Get-Date):   Collection Query Rule info not found"
     }
     try {
         $IncludeRules = $UserCollection | Get-CMUserCollectionIncludeMembershipRule -ErrorAction SilentlyContinue
     }
     catch [System.Management.Automation.PropertyNotFoundException] {
-        Write-Verbose "$(Get-Date):   Collection Include Rule info not found"
+        Write-Debug "$(Get-Date):   Collection Include Rule info not found"
     }
     try {
         $ExcludeRules = $UserCollection | Get-CMUserCollectionExcludeMembershipRule -ErrorAction SilentlyContinue
     }
     catch [System.Management.Automation.PropertyNotFoundException] {
-        Write-Verbose "$(Get-Date):   Collection Include Rule info not found"
+        Write-Debug "$(Get-Date):   Collection Include Rule info not found"
     }
 
     if (-not [string]::IsNullOrEmpty($QueryRules)) {
@@ -3924,6 +5390,7 @@ if ($ListAllInformation)
     Write-HTMLParagraph -Level 5 -File $FilePath -Text 'No collection membership rules defined.'
     }
   }
+  Write-ProgressEx -CurrentOperation "Completed Custom User Collections" -Activity 'User Defined User Collections' -Status 'Collecting details' -Id 7 -Completed
 }
 else
 {
@@ -3931,10 +5398,10 @@ else
 }
 Write-HtmliLink -ReturnTOC -File $FilePath
 #endregion enumerating all User Collections
-
+Write-ProgressEx -CurrentOperation "Completed all user collections"
 
 #region enumerating all Device Collections
-Write-Verbose "$(Get-Date):   Getting Device Collections."
+Write-ProgressEx -CurrentOperation "Getting Device Collections."
 Write-HTMLHeading -Level 2 -PageBreak -Text 'Summary of Device Collections' -File $FilePath
 if ($ListAllInformation){
     Write-HTMLParagraph -Text 'This section contains a brief summary of built-in device collections as well as a more detailed summary of custom device collections.' -Level 3 -File $FilePath
@@ -3942,28 +5409,41 @@ if ($ListAllInformation){
     Write-HTMLParagraph -Text 'This section contains a brief summary of device collections.' -Level 3 -File $FilePath
 }
 $DeviceCollections = Get-CMDeviceCollection
-$BuiltInDeviceCollections = $DeviceCollections | where {$_.IsBuiltIn -eq $true}
-$CustomDeviceCollections = $DeviceCollections | where {$_.IsBuiltIn -eq $false}
-$IncUpCollCount = ($CustomDeviceCollections|where {($_.RefreshType -eq 4) -or ($_.RefreshType -eq 6)}).count
-$ServiceWindowCollections = $CustomDeviceCollections|where {$_.ServiceWindowsCount -gt 0}
+$BuiltInDeviceCollections = @()
+$CustomDeviceCollections = @()
+$IncUpCollCount = @()
+$ServiceWindowCollections = @()
+$BuiltInDeviceCollections = $DeviceCollections | Where-Object {$_.IsBuiltIn -eq $true}
+$CustomDeviceCollections = $DeviceCollections | Where-Object {$_.IsBuiltIn -eq $false}
+$IncUpCollCount = ($CustomDeviceCollections | Where-Object {($_.RefreshType -eq 4) -or ($_.RefreshType -eq 6)}).count
+$ServiceWindowCollections = $CustomDeviceCollections | Where-Object {$_.ServiceWindowsCount -gt 0}
 Write-HtmlList -InputObject "$IncUpCollCount of $($CustomDeviceCollections.Count) have incremental updates Enabled." -Description "Incremental Update Summary:" -Level 3 -File $FilePath
 
+#region Built-in Device Collections
+Write-ProgressEx -CurrentOperation "Getting Built-in Device Collections"
 if ($ListAllInformation)
 {
   Write-HTMLHeading -Level 3 -Text 'Built-In Device Collections' -File $FilePath
   $DevCols = @()
   foreach ($DeviceCollection in $BuiltInDeviceCollections)
   {
-    Write-Verbose "$(Get-Date):   Found Built-in Device Collection: $($DeviceCollection.Name)"
+    Write-ProgressEx -CurrentOperation "Found Built-in Device Collection: $($DeviceCollection.Name)" -Activity 'Built-In Device Collections' -Status 'Collecting details' -Id 8
     # Get collection folder (not visible from Get-CMDeviceCollection cmdlet)
     $CollectionFolder = (Get-WmiObject -Namespace "root\sms\site_$SiteCode" -Class "SMS_Collection" -Filter "CollectionId = '$($DeviceCollection.CollectionID)'" -ComputerName $SMSProvider).ObjectPath
-    $DevCols += New-Object -TypeName psobject -Property @{'Name' = "$($DeviceCollection.Name)"; 'Collection ID' = "$($DeviceCollection.CollectionID)"; 'Member Count' = "$($DeviceCollection.MemberCount)"; 'Folder' = "Root$CollectionFolder";}
+    $DevCols += New-Object -TypeName psobject -Property @{'Name' = "$($DeviceCollection.Name)"; 'Collection ID' = "$($DeviceCollection.CollectionID)"; 'Member Count' = "$($DeviceCollection.MemberCount)"; 'Schedule' = "$(Get-HumanReadableSchedule $DeviceCollection.RefreshSchedule)"; 'Folder' = "Root$CollectionFolder";}
   }
-  $DevCols = $DevCols | Select-Object 'Name','Collection ID','Member Count','Folder'
+  $DevCols = $DevCols | Select-Object 'Name','Collection ID','Member Count','Schedule','Folder'
   Write-HTMLParagraph -Level 4 -File $FilePath -Text 'Summary of membership of the built-in device collections:'
   Write-HtmlTable -InputObject $DevCols -Border 1 -Level 5 -File $FilePath
+  Write-ProgressEx -CurrentOperation 'Found Built-in Device Collection' -Activity 'Built-In Device Collections' -Status 'Collecting details' -Id 8 -Completed
+  Write-ProgressEx -CurrentOperation 'Completed Built-in Device Collections'
+#endregion Built-in Device Collections
+
+#region User Defined Device Collections
+  Write-ProgressEx -CurrentOperation 'User Defined Device Collections'
   Write-HTMLHeading -Level 3 -Text 'User Defined Device Collections' -File $FilePath
   Write-HTMLParagraph -Level 3 -File $FilePath -Text "There are $($CustomDeviceCollections.count) custom defined collections in this site."
+#region Service Window Device Collections
   Write-HTMLParagraph -Level 3 -File $FilePath -Text "There are $($ServiceWindowCollections.count) custom collections with defined service windows.  These are listed below:"
   $SWCollections = @()
   foreach ($collection in $ServiceWindowCollections){
@@ -3972,9 +5452,10 @@ if ($ListAllInformation)
   }
   If($SWCollections.count -eq 0){$SWCollections += "None Found"}
   Write-HtmlList -InputObject $SWCollections -Level 3 -File $FilePath
+#endregion Service Window Device Collections
   foreach ($DeviceCollection in $CustomDeviceCollections)
   {
-    Write-Verbose "$(Get-Date):   Found Custom Device Collection: $($DeviceCollection.Name)"
+    Write-ProgressEx -CurrentOperation "Found user defined device collection: $($DeviceCollection.Name)" -Activity 'Device collection' -Status 'Collecting details' -Id 9
     $CollectionInfo = @()
     $CollectionName = "$($DeviceCollection.Name)"
     # Get collection folder (not visible from Get-CMDeviceCollection cmdlet)
@@ -3998,7 +5479,7 @@ if ($ListAllInformation)
     Write-HTMLParagraph -Level 4 -File $FilePath -Text '<u><b>Collection Maintenance Windows:</b></u>'
     If ($DeviceCollection.ServiceWindowsCount -gt 0) {
         $ServiceWindows = Get-CMMaintenanceWindow -CollectionId $DeviceCollection.CollectionID
-        Write-Verbose "$(Get-Date):   Enumerating Maintenance Windows for collection: $($DeviceCollection.Name)"
+        Write-Debug "$(Get-Date):   Enumerating Maintenance Windows for collection: $($DeviceCollection.Name)"
         $ServiceWindowArray = @()
         foreach ($ServiceWindow in $ServiceWindows)
             {
@@ -4073,28 +5554,28 @@ if ($ListAllInformation)
         $ExcludeRules = $Null
 
         try {
-            $DirectRules = $DeviceCollection | Get-CMDeviceCollectionDirectMembershipRule -ErrorAction SilentlyContinue
+            $DirectRules = $DeviceCollection | Get-CMDeviceCollectionDirectMembershipRule -ErrorAction Stop
         }
         catch [System.Management.Automation.PropertyNotFoundException] {
-            Write-Verbose "$(Get-Date):   Collection Direct Rule info not found"
+            Write-Debug "$(Get-Date):   Collection Direct Rule info not found"
         }
         try {
-            $QueryRules = $DeviceCollection | Get-CMDeviceCollectionQueryMembershipRule -ErrorAction SilentlyContinue
+            $QueryRules = $DeviceCollection | Get-CMDeviceCollectionQueryMembershipRule -ErrorAction Stop
         }
         catch [System.Management.Automation.PropertyNotFoundException] {
-            Write-Verbose "$(Get-Date):   Collection Query Rule info not found"
+            Write-Debug "$(Get-Date):   Collection Query Rule info not found"
         }
         try {
-            $IncludeRules = $DeviceCollection | Get-CMDeviceCollectionIncludeMembershipRule -ErrorAction SilentlyContinue
+            $IncludeRules = $DeviceCollection | Get-CMDeviceCollectionIncludeMembershipRule -ErrorAction Stop
         }
         catch [System.Management.Automation.PropertyNotFoundException] {
-            Write-Verbose "$(Get-Date):   Collection Include Rule info not found"
+            Write-Debug "$(Get-Date):   Collection Include Rule info not found"
         }
         try {
-            $ExcludeRules = $DeviceCollection | Get-CMDeviceCollectionExcludeMembershipRule -ErrorAction SilentlyContinue
+            $ExcludeRules = $DeviceCollection | Get-CMDeviceCollectionExcludeMembershipRule -ErrorAction Stop
         }
         catch [System.Management.Automation.PropertyNotFoundException] {
-            Write-Verbose "$(Get-Date):   Collection Include Rule info not found"
+            Write-Debug "$(Get-Date):   Collection Include Rule info not found"
         }
 
         if (-not [string]::IsNullOrEmpty($QueryRules)) {
@@ -4133,20 +5614,23 @@ if ($ListAllInformation)
         Write-HTMLParagraph -Level 5 -File $FilePath -Text 'No collection membership rules defined.'
         }
     }
+  Write-ProgressEx -CurrentOperation "Completed user defined device collections" -Activity 'Device collection' -Status 'Collecting details' -Id 9 -Completed
 }else{
   Write-HTMLParagraph -Text "There are $($CustomDeviceCollections.count) User Defined Device collections.  These are in addition to the $($BuiltInDeviceCollections.count) built-in default device collections." -Level 3 -File $FilePath
 }
 Write-HtmliLink -ReturnTOC -File $FilePath
-#endregion enumerating all Device Collections
+Write-ProgressEx -CurrentOperation 'Completed User Defined Device Collections'
+#endregion User Defined Device Collections
 
 
 #region enumerating all Compliance Settings
-Write-Verbose "$(Get-Date):   Working on Compliance Settings"
+Write-ProgressEx -CurrentOperation "Working on Compliance Settings"
 Write-HTMLHeading -Level 2 -PageBreak -Text 'Compliance Settings' -File $FilePath
 Write-HTMLParagraph -Text 'This section contains a summary of all configuration items, baselines, Settings, Conditional Access, and other configurable resources.' -Level 3 -File $FilePath
 #region enumerating all Configuration Items and baselines.
+Write-ProgressEx -CurrentOperation 'Configuration Items'
 Write-HTMLHeading -Level 3 -Text 'Configuration Items' -File $FilePath
-$CIs = Get-CMConfigurationItem -Fast | Where {$_.IsUserDefined -eq "true"}
+$CIs = Get-CMConfigurationItem -Fast | Where-Object {$_.IsUserDefined -eq "true"}
 if(-not [string]::IsNullOrEmpty($CIs)){
     $CIsArray = @()
     foreach ($CI in $CIs){
@@ -4157,8 +5641,10 @@ if(-not [string]::IsNullOrEmpty($CIs)){
 }else{
     Write-HTMLParagraph -Text 'There are no Configuration Items configured.' -Level 3 -File $FilePath
 }
+Write-ProgressEx -CurrentOperation 'Completed Configuration Items'
+Write-ProgressEx -CurrentOperation 'Configuration Baselines'
 Write-HTMLHeading -Level 3 -Text 'Configuration Baselines' -File $FilePath
-$CBs = Get-CMBaseline | Where {$_.IsUserDefined -eq "true"}
+$CBs = Get-CMBaseline | Where-Object {$_.IsUserDefined -eq "true"}
 if ($CBs){
     $CBsArray = @()
     foreach ($CB in $CBs){
@@ -4169,13 +5655,14 @@ if ($CBs){
 } else {
     Write-HTMLParagraph -Text 'There are no Configuration Baselines configured.' -Level 3 -File $FilePath
 }
+Write-ProgressEx -CurrentOperation 'Completed Configuration Baselines'
 #endregion enumerating all Configuration Items and baselines.
 
-#region enumerating Configuration Policies...
-Write-Verbose "$(Get-Date):   Working on Configuration Policies..."
+#region enumerating Configuration Policies
+Write-ProgressEx -CurrentOperation 'Working on Configuration Policies'
 $CMPolicies=@()
-$CMPolicies=Get-CMConfigurationPolicy -fast | select CategoryInstance_UniqueIDs,LocalizedDisplayName,LocalizedCategoryInstanceNames,CI_ID,LastModifiedBy,DateLastModified,IsAssigned
-Write-Verbose "$(Get-Date):   $($CMPolicies.count) Configuration Policies found."
+$CMPolicies=Get-CMConfigurationPolicy -fast | Select-Object CategoryInstance_UniqueIDs,LocalizedDisplayName,LocalizedCategoryInstanceNames,CI_ID,LastModifiedBy,DateLastModified,IsAssigned
+Write-ProgressEx -CurrentOperation "$($CMPolicies.count) Configuration Policies found"
 
 $ComplianceSettings = @()
 $RemoteSettings = @()
@@ -4187,7 +5674,10 @@ $WinHelloSettings = @()
 $WiFiProfileSettings = @()
 $VpnSettings = @()
 $CertSettings = @()
+$EdgeBrowser = @()
+$KFMSettings = @()
 
+Write-ProgressEx -CurrentOperation "Processing [$($CMPolicies.count)] Configuration Policies"
 foreach ($CMPolicy in $CMPolicies){
     Switch ($CMPolicy){
         {'SettingsAndPolicy:SMS_CompliancePolicySettings' -in $_.CategoryInstance_UniqueIDs}{
@@ -4220,6 +5710,52 @@ foreach ($CMPolicy in $CMPolicies){
         {'SettingsAndPolicy:SMS_TrustedRootCertificateSettings' -in $_.CategoryInstance_UniqueIDs}{
             $CertSettings += New-Object -TypeName psobject -Property @{Name = "$($CMPolicy.LocalizedDisplayName)";'Modified By' = "$($CMPolicy.LastModifiedBy)";'Modified' = "$($CMPolicy.DateLastModified)"; Deployed = "$($CMPolicy.IsAssigned)"}
         }
+        {'SettingsAndPolicy:SMS_EdgeBrowserSettings' -in $_.CategoryInstance_UniqueIDs}{
+            $EdgeBrowser += New-Object -TypeName psobject -Property @{Name = "$($CMPolicy.LocalizedDisplayName)";'Modified By' = "$($CMPolicy.LastModifiedBy)";'Modified' = "$($CMPolicy.DateLastModified)"; Deployed = "$($CMPolicy.IsAssigned)"}
+        }
+        {'SettingsAndPolicy:SMS_OneDriveKnownFolderMigrationSettings' -in $_.CategoryInstance_UniqueIDs}{
+            $KfmXml = [xml](Get-CMConfigurationPolicy -Id $CMPolicy.CI_ID).SDMPackageXML
+            $KfmDeployed = $CMPolicy.IsAssigned
+            $KfmName = $KfmXml.DesiredConfigurationDigest.ConfigurationPolicy.Annotation.DisplayName.text
+            $KfmDescription = $KfmXml.DesiredConfigurationDigest.ConfigurationPolicy.Annotation.Description.text
+            $KfmPlatforms = $KfmXml.DesiredConfigurationDigest.ConfigurationPolicy.PlatformApplicabilityCondition.OperatingSystemExpression.Operands.RuleExpression.RuleId -join '; '
+            $KfmSilentMove = ($KfmXml.DesiredConfigurationDigest.ConfigurationPolicy.Rules.rule| Where-Object {$_.ID -eq 'Rule_OneDrive_KFMSilentOptIn'}).expression.operands.constantvalue.value
+            If (!([string]::IsNullOrEmpty($KfmSilentMove))){
+                $KFMSilentOptIn = 'Enabled'
+                $KFMOptInWithWizard = 'Disabled'
+                $O365ID = $KfmSilentMove
+            }
+            $KfmPromptToMove = ($KfmXml.DesiredConfigurationDigest.ConfigurationPolicy.Rules.rule| Where-Object {$_.ID -eq 'Rule_OneDrive_KFMOptInWithWizard'}).expression.operands.constantvalue.value
+            If (!([string]::IsNullOrEmpty($KfmPromptToMove))){
+                $KFMSilentOptIn = 'Disabled'
+                $KFMOptInWithWizard = 'Enabled'
+                $O365ID = $KfmPromptToMove
+            }
+            $KfmNoteAfter = ($KfmXml.DesiredConfigurationDigest.ConfigurationPolicy.Rules.rule| Where-Object {$_.ID -eq 'Rule_OneDrive_KFMSilentOptInWithNotification'}).expression.operands.constantvalue.value #1 = Enabled
+            If ($KfmNoteAfter -eq 1){
+                $KfmNoteAfter = 'Enabled'
+            } else {
+                $KfmNoteAfter = 'Disabled'
+            }
+            $KfmBlockOptOut = ($KfmXml.DesiredConfigurationDigest.ConfigurationPolicy.Rules.rule| Where-Object {$_.ID -eq 'Rule_OneDrive_KFMBlockOptOut'}).expression.operands.constantvalue.value #1 = Enabled
+            If ($KfmBlockOptOut -eq 1){
+                $KfmBlockOptOut = 'Enabled'
+            } else {
+                $KfmBlockOptOut = 'Disabled'
+            }
+            $KFMSettings += [pscustomobject]@{
+                Name           = $KfmName
+                Description    = $KfmDescription
+                Platforms      = $KfmPlatforms
+                O365ID         = $O365ID
+                PromptToMove   = $KFMOptInWithWizard
+                SilentMove     = $KFMSilentOptIn
+                NotifyComplete = $KfmNoteAfter
+                BlockOptOut    = $KfmBlockOptOut
+                Deployed       = $KfmDeployed
+                CI_ID          = $CMPolicy.CI_ID
+            }
+        }
     }
 }
 Write-HTMLHeading -Level 3 -Text 'User Data and Profiles' -File $FilePath
@@ -4228,6 +5764,28 @@ if ($UserStateSettings.count -gt 0) {
     Write-HtmlTable -InputObject $UserStateSettings -Border 1 -Level 4 -File $FilePath
 }else{
     Write-HTMLParagraph -Text 'No User Data and Profiles defined in site.' -Level 4 -File $FilePath
+}
+Write-HTMLHeading -Level 3 -Text 'OneDrive For Business Profiles' -File $FilePath
+if ($KFMSettings.count -gt 0) {
+    foreach ($KFMsetting in $KFMSettings) {
+        $listArray = @()
+        $listArray += "Supported Platforms: $($KFMsetting.Platforms)"
+        $listArray += "Office 365 TenantId: $($KFMsetting.O365ID)"
+        $listArray += "Prompt users to move Windows known folders to OneDrive: $($KFMsetting.PromptToMove)"
+        $listArray += "Silently move Windows known folders to OneDrive: $($KFMsetting.SilentMove)"
+        $listArray += "Show notification to users after folders have been redirected: $($KFMsetting.NotifyComplete)"
+        $listArray += "Prevent users from redirecting their Windows known folders back to their PC: $($KFMsetting.BlockOptOut)"
+        Write-HtmlList -Title "$($KFMsetting.Name)" -Description "Description: $($KFMsetting.Description)" -InputObject $listArray -Level 4 -File $FilePath
+        If ($KFMSetting.Deployed -eq "True"){
+            $KFMDeployments = Get-CMConfigurationPolicyDeployment -SmsObjectId 16780575 | foreach {Get-CMCollection -Id $_.TargetCollectionID}|select CollectionID,Name
+            Write-HTMLParagraph -Text 'Deployments:' -Level 4 -File $FilePath
+            Write-HtmlTable -InputObject $KFMDeployments -Level 4 -File $FilePath
+        } else {
+            Write-HTMLParagraph -Text 'Deployments: None' -Level 4 -File $FilePath
+        }
+    }
+}else{
+    Write-HTMLParagraph -Text 'No OneDrive For Business Profiles defined in site.' -Level 4 -File $FilePath
 }
 Write-HTMLHeading -Level 3 -Text 'Remote Connection Profiles' -File $FilePath
 if ($RemoteSettings.count -gt 0) {
@@ -4295,18 +5853,28 @@ if ($EdUpgradeSettings.count -gt 0) {
 }else{
     Write-HTMLParagraph -Text 'No Windows 10 Edition Upgrades defined in site.' -Level 4 -File $FilePath
 }
+Write-HTMLHeading -Level 3 -Text 'Microsoft Edge Browser Profiles' -File $FilePath
+if ($EdgeBrowser.count -gt 0) {
+    $EdgeBrowser = $EdgeBrowser | Select-Object 'Name','Modified By','Modified','Deployed'
+    Write-HtmlTable -InputObject $EdgeBrowser -Border 1 -Level 4 -File $FilePath
+}else{
+    Write-HTMLParagraph -Text 'No Windows 10 Edition Upgrades defined in site.' -Level 4 -File $FilePath
+}
+Write-ProgressEx -CurrentOperation 'Completed Configuration Policies'
+#endregion enumerating Configuration Policies
 
-#endregion enumerating Configuration Policies.
 Write-HtmliLink -ReturnTOC -File $FilePath
+Write-ProgressEx -CurrentOperation 'Completed all Compliance Settings'
 #endregion enumerating all Compliance Settings
 
 #region Endpoint Protection
-Write-Verbose "$(Get-Date):   Working on Endpoint Protection"
+Write-ProgressEx -CurrentOperation 'Endpoint Protection settings'
 Write-HTMLHeading -Level 2 -PageBreak -Text 'Endpoint Protection' -File $FilePath
 Write-HTMLParagraph -Text 'This section contains a summary of all Endpoint Security configuration settings.  This includes System Center Endpoint Protection (Antimalware), Firewall, Windows Defender ATP, and Device Guard Policies.' -Level 3 -File $FilePath
 #region Antimalware
+Write-ProgressEx -CurrentOperation 'Antimalware Policies'
 Write-HTMLHeading -Level 3 -Text 'Antimalware Policies' -File $FilePath
-if (-not ($(Get-CMEndpointProtectionPoint) -eq $Null)){
+if (-not ($Null -eq $(Get-CMEndpointProtectionPoint))){
     $AntiMalwarePolicies = Get-CMAntimalwarePolicy
     if (-not [string]::IsNullOrEmpty($AntiMalwarePolicies)){
         foreach ($AntiMalwarePolicy in $AntiMalwarePolicies){
@@ -4737,9 +6305,11 @@ if (-not ($(Get-CMEndpointProtectionPoint) -eq $Null)){
 }else{
     Write-HTMLParagraph -Text 'There is no Endpoint Protection Point enabled in this site.' -Level 3 -File $FilePath
 }
+Write-ProgressEx -CurrentOperation 'Completed Antimalware Policies'
 #endregion Antimalware
 #region firewall and Device Guard
-$FWPolicies = Get-CMConfigurationPolicy -Fast | where {$_.CategoryInstance_UniqueIDs -contains 'SettingsAndPolicy:SMS_FirewallSettings' -or $_.CategoryInstance_UniqueIDs -contains 'SettingsAndPolicy:SMS_DeviceGuardSettings'} | select CategoryInstance_UniqueIDs,LocalizedDisplayName,LocalizedCategoryInstanceNames,CI_ID,LastModifiedBy,DateLastModified,IsAssigned
+Write-ProgressEx -CurrentOperation 'Firewall and Device Guard'
+$FWPolicies = Get-CMConfigurationPolicy -Fast | Where-Object {$_.CategoryInstance_UniqueIDs -contains 'SettingsAndPolicy:SMS_FirewallSettings'} | Select-Object CategoryInstance_UniqueIDs,LocalizedDisplayName,LocalizedCategoryInstanceNames,CI_ID,LastModifiedBy,DateLastModified,IsAssigned
 Write-HTMLHeading -Level 3 -Text 'Windows Defender Firewall Policies' -File $FilePath
 if (-not [string]::IsNullOrEmpty($FWPolicies)) {
     $FWArray = @()
@@ -4751,8 +6321,44 @@ if (-not [string]::IsNullOrEmpty($FWPolicies)) {
 }else{
     Write-HTMLParagraph -Text 'No firewall policies defined in site.' -Level 4 -File $FilePath
 }
-$DeviceGuardPolicies = Get-CMConfigurationPolicy -Fast | where {$_.CategoryInstance_UniqueIDs -contains 'SettingsAndPolicy:SMS_DeviceGuardSettings'} | select CategoryInstance_UniqueIDs,LocalizedDisplayName,LocalizedCategoryInstanceNames,CI_ID,LastModifiedBy,DateLastModified,IsAssigned
-Write-HTMLHeading -Level 3 -Text 'Device Guard Policies' -File $FilePath
+$ATPPolicies = Get-CMConfigurationPolicy -Fast | Where-Object {$_.CategoryInstance_UniqueIDs -contains 'SettingsAndPolicy:SMS_AdvancedThreatProtectionSettings'} | Select-Object CategoryInstance_UniqueIDs,LocalizedDisplayName,LocalizedCategoryInstanceNames,CI_ID,LastModifiedBy,DateLastModified,IsAssigned
+Write-HTMLHeading -Level 3 -Text 'Windows Defender ATP Policies' -File $FilePath
+if (-not [string]::IsNullOrEmpty($ATPPolicies)) {
+    $ATPArray = @()
+    foreach ($ATP in $ATPPolicies){
+        $ATPArray += New-Object -TypeName psobject -Property @{'Name'=$ATP.LocalizedDisplayName;'Modified By'=$ATP.LastModifiedBy;'Modified'=$ATP.DateLastModified;'Deployed'=$ATP.IsAssigned}
+    }
+    $ATPArray = $ATPArray | Select-Object 'Name','Modified By','Modified','Deployed'
+    Write-HtmlTable -InputObject $ATPArray -Border 1 -Level 4 -File $FilePath
+}else{
+    Write-HTMLParagraph -Text 'No ATP Policies defined in site.' -Level 4 -File $FilePath
+}
+$ExploitGuardPolicies = Get-CMConfigurationPolicy -Fast | Where-Object {$_.CategoryInstance_UniqueIDs -contains 'SettingsAndPolicy:SMS_ExploitGuardSettings'} | Select-Object CategoryInstance_UniqueIDs,LocalizedDisplayName,LocalizedCategoryInstanceNames,CI_ID,LastModifiedBy,DateLastModified,IsAssigned
+Write-HTMLHeading -Level 3 -Text 'Windows Defender Exploit Guard Policies' -File $FilePath
+if (-not [string]::IsNullOrEmpty($ExploitGuardPolicies)) {
+    $ExploitGuardArray = @()
+    foreach ($EGP in $ExploitGuardPolicies){
+        $ExploitGuardArray += New-Object -TypeName psobject -Property @{'Name'=$EGP.LocalizedDisplayName;'Modified By'=$EGP.LastModifiedBy;'Modified'=$EGP.DateLastModified;'Deployed'=$EGP.IsAssigned}
+    }
+    $ExploitGuardArray = $ExploitGuardArray | Select-Object 'Name','Modified By','Modified','Deployed'
+    Write-HtmlTable -InputObject $ExploitGuardArray -Border 1 -Level 4 -File $FilePath
+}else{
+    Write-HTMLParagraph -Text 'No Exploit Guard Policies defined in site.' -Level 4 -File $FilePath
+}
+$ApplicationGuardPolicies = Get-CMConfigurationPolicy -Fast | Where-Object {$_.CategoryInstance_UniqueIDs -contains 'SettingsAndPolicy:SMS_WindowsDefenderApplicationGuard'} | Select-Object CategoryInstance_UniqueIDs,LocalizedDisplayName,LocalizedCategoryInstanceNames,CI_ID,LastModifiedBy,DateLastModified,IsAssigned
+Write-HTMLHeading -Level 3 -Text 'Windows Defender Application Guard Policies' -File $FilePath
+if (-not [string]::IsNullOrEmpty($ApplicationGuardPolicies)) {
+    $ApplicationGuardArray = @()
+    foreach ($AGP in $ApplicationGuardPolicies){
+        $ApplicationGuardArray += New-Object -TypeName psobject -Property @{'Name'=$AGP.LocalizedDisplayName;'Modified By'=$AGP.LastModifiedBy;'Modified'=$AGP.DateLastModified;'Deployed'=$AGP.IsAssigned}
+    }
+    $ApplicationGuardArray = $ApplicationGuardArray | Select-Object 'Name','Modified By','Modified','Deployed'
+    Write-HtmlTable -InputObject $ApplicationGuardArray -Border 1 -Level 4 -File $FilePath
+}else{
+    Write-HTMLParagraph -Text 'No Application Guard Policies defined in site.' -Level 4 -File $FilePath
+}
+$DeviceGuardPolicies = Get-CMConfigurationPolicy -Fast | Where-Object {$_.CategoryInstance_UniqueIDs -contains 'SettingsAndPolicy:SMS_DeviceGuardSettings'} | Select-Object CategoryInstance_UniqueIDs,LocalizedDisplayName,LocalizedCategoryInstanceNames,CI_ID,LastModifiedBy,DateLastModified,IsAssigned
+Write-HTMLHeading -Level 3 -Text 'Windows Defender Applicatin Control Policies' -File $FilePath
 if (-not [string]::IsNullOrEmpty($DeviceGuardPolicies)) {
     $DeviceGuardArray = @()
     foreach ($DGP in $DeviceGuardPolicies){
@@ -4761,9 +6367,11 @@ if (-not [string]::IsNullOrEmpty($DeviceGuardPolicies)) {
     $DeviceGuardArray = $DeviceGuardArray | Select-Object 'Name','Modified By','Modified','Deployed'
     Write-HtmlTable -InputObject $DeviceGuardArray -Border 1 -Level 4 -File $FilePath
 }else{
-    Write-HTMLParagraph -Text 'No Device Guard policies defined in site.' -Level 4 -File $FilePath
+    Write-HTMLParagraph -Text 'No Applicatin Control Policies defined in site.' -Level 4 -File $FilePath
 }
+Write-ProgressEx -CurrentOperation 'Completed Firewall and Device Guard'
 #endregion firewall and Device Guard
+Write-ProgressEx -CurrentOperation 'Completed Endpoint Protection settings'
 #region Windows Defender ATP
     #TBD
 #endregion Windows Defender ATP
@@ -4779,11 +6387,14 @@ if (-not [string]::IsNullOrEmpty($DeviceGuardPolicies)) {
 #endregion Corporate-owned Devices
 
 Write-HtmliLink -ReturnTOC -File $FilePath
-Write-Verbose "$(Get-Date):   Done with Assets and Compliance, next Software Library"
+Write-ProgressEx -CurrentOperation "Done with Assets and Compliance, next Software Library"
+#endregion Assets and Compliance
 
 ####
 #region Software Library
 ####
+$Progress = @{'Activity'="$Title started $($ScriptStartTime.ToShortTimeString())"; 'Status'='Software Library'}
+Write-ProgressEx -CurrentOperation 'Beginning Software Library'
 
 Write-HTMLHeading -Level 1 -PageBreak -Text 'Software Library' -File $FilePath
 
@@ -4791,90 +6402,287 @@ Write-HTMLHeading -Level 1 -PageBreak -Text 'Software Library' -File $FilePath
 Write-HTMLHeading -Level 2 -PageBreak -Text 'Application Management' -File $FilePath
 
 #region Applications
-Write-Verbose "$(Get-Date):   Processing CM Appications."
+Write-ProgressEx -CurrentOperation 'Processing Applications'
 Write-HTMLHeading -Level 3 -Text 'Applications' -File $FilePath
 #$Applications = Get-WmiObject -Class sms_applicationlatest -Namespace root\sms\site_$SiteCode -ComputerName $SMSProvider
 #Get-CMApplication | select LocalizedDisplayName,LocalizedDescription,Manufacturer,SoftwareVersion,PackageID,ISExpired,ISDeployed,NumberOfDeploymentTypes
-$Applications = Get-CMApplication
-$Applications = $Applications|sort LocalizedDisplayName
+$Applications = Get-CMApplication|Sort-Object LocalizedDisplayName
 if ($ListAllInformation -or $ListAppDetails){
     if (-not [string]::IsNullOrEmpty($Applications)) {
         Write-HTMLParagraph -Text "Below are a summary of all $($Applications.Count) application installers defined in this site. These are applications that are installed with the configuration manager application model.  Packages are covered later in the documentation." -Level 3 -File $FilePath
         foreach ($App in $Applications) {
-            Write-Verbose "$(Get-Date):   Found App: $($App.LocalizedDisplayName)"
+            #region Application Details
+            Write-ProgressEx -CurrentOperation "Application: $($App.LocalizedDisplayName)" -Activity 'Configuration Manager Application' -Status 'Application details' -Id 10
             Write-HTMLHeading -Level 4 -Text "$($App.LocalizedDisplayName)" -File $FilePath
-            $AppList = @()
             if ($App.LocalizedDescription -ne ""){
-                $ListDescription = "Description: $($App.LocalizedDescription)"
+                Write-HTMLParagraph -Text "Applicaton Description: $($App.LocalizedDescription)" -Level 4 -File $FilePath
             }
+            Write-Debug "$(Get-Date):   Processing General application Info.."
+            $ListDescription = "General Application Information"
+            $AppList = @()
             $AppList += "Created by: $($App.CreatedBy)"
             $AppList += "Date created: $($App.DateCreated)"
+            $AppList += "Date published: $($app.EffectiveDate)"
+            $AppList += "Modified date: $($app.DateLastModified)"
+            $AppList += "Modified by: $($app.LastModifiedBy)"
+            $AppList += "Revision number: $($app.CIVersion)"
             $AppList += "Publisher: $($App.Manufacturer)"
-            $AppList += "Software Version: $($App.SoftwareVersion)"
+            $AppList += "Software version: $($App.SoftwareVersion)"
             $AppList += "CM Package ID: $($App.PackageID)"
-            $AppList += "Enabled: $($App.ISEnabled)"
+            $AppList += "Retired: $($App.IsExpired)"
             $AppList += "Deployed: $($App.ISDeployed)"
-            If ($ListDescription -ne "") {
-                Write-HtmlList -InputObject $AppList -Description $ListDescription -Level 5 -File $FilePath
-            }Else{
-                Write-HtmlList -InputObject $AppList -Level 5 -File $FilePath
-            }
+            Write-HtmlList -InputObject $AppList -Description $ListDescription -Level 5 -File $FilePath
             $ListDescription = ""
-            Write-Verbose "$(Get-Date):   Processing deployment types for: $($App.LocalizedDisplayName)"
-            $DTs = Get-CMDeploymentType -ApplicationName "$($App.LocalizedDisplayName)"
-            [xml]$PackageXML = $App.SDMPackageXML
+            Write-Debug "$(Get-Date):   Completed General application Info.."
+
+            $PackageXML = [xml]$App.SDMPackageXML
+
+            Write-Debug "$(Get-Date):   Processing application Software Center info.."
+            $ListDescription = "Software Center Details"
+            $AppList = @()
+            $AppList += "Localized App Name:  $($PackageXML.AppMgmtDigest.Application.DisplayInfo.info.Title)"
+            If (!([string]::IsNullOrEmpty($PackageXML.AppMgmtDigest.Application.DisplayInfo.info.UserCategories.Tag))){
+                $AppList += "User categories:   $($($PackageXML.AppMgmtDigest.Application.DisplayInfo.info.UserCategories.Tag) -join '; ')"
+            }
+            $AppList += "User documentation:  $($PackageXML.AppMgmtDigest.Application.DisplayInfo.info.InfoUrl)"
+            $AppList += "Link text:  $($PackageXML.AppMgmtDigest.Application.DisplayInfo.info.InfoUrlText)"
+            $AppList += "Localized description:  $($PackageXML.AppMgmtDigest.Application.DisplayInfo.info.Description)"
+            $AppList += "Keywords:  $($($xml.AppMgmtDigest.Application.DisplayInfo.info.tags.tag) -join ';')"
+            If ([string]::IsNullOrEmpty($PackageXML.AppMgmtDigest.Application.DisplayInfo.info.Icon)){
+                $AppList += "Custom Icon:  None"
+            } else {
+                $AppList += "Custom Icon:  Yes"
+            }
+            $AppList += "Featured App: $($App.Featured)"
+            Write-HtmlList -InputObject $AppList -Description $ListDescription -Level 5 -File $FilePath
+            $ListDescription = ""
+            Write-Debug "$(Get-Date):   Completed application Software Center info.."
+
+            Write-Debug "$(Get-Date):   Processing application content locations.."
+            #Content Locations:
+            #SELECT * FROM SMS_DPGroupContentInfo
+            #SELECT * FROM SMS_DPContentInfo
+            Write-Debug "$(Get-Date):   Completed application content locations.."
+
+            Write-Debug "$(Get-Date):   Processing application distribution settings.."
+            $ListDescription = "Distribution Details"
+            $AppList = @()
+            switch ($xml.AppMgmtDigest.Application.HighPriority) {
+                1 { $Priority = "High" }
+                2 { $Priority = "Medium" }
+                3 { $Priority = "Low" }
+                Default {$Priority = "Medium"}
+            }
+            $AppList += "Distribution Priority:  $Priority"
+            If ($xml.AppMgmtDigest.Application.SendToProtectedDP -eq 'true'){
+                $AppList += "Enable for On-demand Distribution: True"
+            } else {
+                $AppList += "Enable for On-demand Distribution: False"
+            }
+            If ($xml.AppMgmtDigest.Application.AutoDistribute -eq 'true'){
+                $AppList += "Prestaged Distribution Point settings: Automatically downloadcontent when packages are assigned to distribution points"
+            }
+            elseIf ($xml.AppMgmtDigest.Application.DownloadDelta -eq 'true'){
+                $AppList += "Prestaged Distribution Point settings: Download only content changes to the distribution point"
+            }
+            ELSE{
+                $AppList += "Prestaged Distribution Point settings: Manually copy the content in this package to the distribution point"
+            }
+            Write-HtmlList -InputObject $AppList -Description $ListDescription -Level 5 -File $FilePath
+            $ListDescription = ""
+            Write-Debug "$(Get-Date):   Completed application distribution settings.."
+
+            Write-Debug "$(Get-Date):   Processing Supersedence info.."
+            $ListDescription = "Supersedence details"
+            $AppList = @()
+            $AppList += "Supersedes other applications:  $($app.IsSuperseding)"
+            $AppList += "Is superseded by another application:  $($app.IsSuperseded)"
+            if ($xml.AppMgmtDigest.Application.DisplaySupersedes -eq 'true'){
+                $AppList += "Allow user to see this app and all apps that it supercedes in Software Center: Yes"
+            } else {
+                $AppList += "Allow user to see this app and all apps that it supercedes in Software Center: No"
+            }
+            Write-HtmlList -InputObject $AppList -Description $ListDescription -Level 5 -File $FilePath
+            $ListDescription = ""
+            Write-Debug "$(Get-Date):   Completed supersedence details"
+            #endregion Application Details
+            
+            #region deployment types
+            Write-ProgressEx -CurrentOperation "Application: $($App.LocalizedDisplayName)" -Activity 'Configuration Manager Application' -Status 'Application deployment types' -Id 10
+            Write-Debug "$(Get-Date):   Processing deployment types for: $($App.LocalizedDisplayName)"
+            $DTs = $PackageXML.AppMgmtDigest.DeploymentType
             if (-not [string]::IsNullOrEmpty($DTs)) {
-                $DTsArray = @()
                 foreach ($DT in $DTs) {
-                    #$xmlDT = [xml]$DT.SDMPackageXML
-                    foreach ($xl in $PackageXML.AppMgmtDigest.DeploymentType) {
-                        if ($dt.ContentId -eq $xl.Installer.Contents.Content.ContentId) {
-                            Write-Verbose "$(Get-Date):   Found Deployment Type:  $($xl.Title.'#text')"
-                            $Content = "$($xl.Installer.contents.content.location)"
-                            if (Test-Path "filesystem::$Content" -ErrorAction SilentlyContinue){
-                                $Verified = "Verified"
-                            }else{
-                                $Verified = "Unverified!"
-                            }
-                            $InstallCL = "$($xl.installer.customdata.installcommandline)"
-                            $UninstallCL = "$($xl.installer.customdata.uninstallcommandline)"
-                        }
-                        if ($xl.Technology -eq "Deeplink"){ #this is a windows store app.  There is no onprem content.
-                            $Content = "$($xl.Installer.CustomData.PackageUriNew)"
-                            $Verified = "N/A"
-                            $InstallCL = "N/A"
-                            $UninstallCL = "N/A"
+                    Write-HTMLHeading -Level 5 -Text "Deployment Type: $($DT.title.'#text')" -File $FilePath
+                    $DTListData = @()
+                    $DTSection = "General"
+                    $DTListData += "Technology: $($DT.Technology)"
+                    $DTListData += "Admin Comments: $($DT.Description.'#text')"
+                    $DTListData += "Languages: $($($DT.Languages.lang) -join ',')"
+                    Write-HtmlList -InputObject $DTListData -Description $DTSection -Level 6 -File $FilePath
+
+                    $DTListData = @()
+                    $DTSection = "Content"
+                    $InstallContent = $DT.Installer.Contents.Content | Where-Object {$_.ContentID -eq $DT.Installer.CustomData.InstallContent.ContentId}
+                    $DTListData += "Content Location: $($InstallContent.Location)"
+                    switch ($dt.Installer.CustomData.UninstallSetting) {
+                        'Different' { $UninstallContentSetting = 'Different from install content' }
+                        'SameAsInstall' { $UninstallContentSetting = 'Same as install content'}
+                        'NoneRequired' { $UninstallContentSetting = 'No uninstall content'}
+                        Default { $UninstallContentSetting = 'Same as install content' }
+                    }
+                    $DTListData += "Uninstall content settings: $UninstallContentSetting"
+                    If ($UninstallContentSetting -eq 'Different from install content' ){
+                        $UnInstallContent = $dt.Installer.Contents.Content | Where-Object {$_.ContentID -eq $dt.Installer.CustomData.UninstallContent.ContentId}
+                        $DTListData += "Uninstall content location: $($UnInstallContent.Location)"
+                    } else{
+                        $DTListData += "Uninstall content location: N/A"
+                    }
+                    If ($InstallContent.PinOnClient -eq 'true'){
+                        $DTListData += "Persist in the client cache: True"
+                    } else {
+                        $DTListData += "Persist in the client cache: False"
+                    }
+                    If ($InstallContent.FallbackToUnprotectedDP -eq 'true'){
+                        $DTListData += "Allow clients to use DP from the default site: True"
+                    } else {
+                        $DTListData += "Allow clients to use DP from the default site: False"
+                    }
+                    switch ($InstallContent.OnSlowNetwork) {
+                        'DoNothing' { $DTListData += "Deployment options for neighbor or default boundary group: Do not download content" }
+                        'Download' { $DTListData += "Deployment options for neighbor or default boundary group: Download content from DP and run locally" }
+                        Default { $DTListData += "Deployment options for neighbor or default boundary group: Download content from DP and run locally" }
+                    }
+                    Write-HtmlList -InputObject $DTListData -Description $DTSection -Level 6 -File $FilePath
+
+                    $DTListData = @()
+                    $DTSection = "Programs"
+                    $DTListData += "Install program: $(($DT.Installer.InstallAction.Args.arg | Where-Object {$_.name -eq 'InstallCommandLine'}).'#text')"
+                    #$DTListData += "Content ID: $($DT.Installer.InstallAction.Contents.Content.ContentId)"
+                    $DTListData += "Uninstall program: $(($DT.Installer.UninstallAction.Args.arg | Where-Object {$_.name -eq 'InstallCommandLine'}).'#text')"
+                    #$DTListData += "Content ID: $($DT.Installer.UninstallAction.Contents.Content.ContentId)"
+                    $DTListData += "Repair program: $(($DT.Installer.RepairAction.Args.arg | Where-Object {$_.name -eq 'InstallCommandLine'}).'#text')"
+                    #$DTListData += "Content ID: $($DT.Installer.RepairAction.Contents.Content.ContentId)"
+                    $DTListData += "Run installation and uninstall program as 32-bit process on 64-bit clients:  $(($DT.Installer.InstallAction.Args.arg | Where-Object {$_.name -eq 'RunAs32Bit'}).'#text')"
+                    Write-HtmlList -InputObject $DTListData -Description $DTSection -Level 6 -File $FilePath
+                    
+                    $DTListData = @()
+                    $DTSection = "Detection Method"
+                    If ($DT.Installer.DetectAction.Provider -like 'MSI'){
+                        #MSI
+                        $ProductCode = ($DT.Installer.DetectAction.args.arg | Where-Object {$_.Name -eq 'ProductCode'}).'#text'
+                        $DTListData += "MSI detection method."
+                        $DTListData += "MSI Product Code: $ProductCode"
+                    } elseif ($DT.Installer.DetectAction.Provider -like 'Local') {
+                        #Enhanced Detection Method
+                        $DTListData += "Using enhanced detection method."
+                        #$EDM = [xml]($DT.Installer.DetectAction.Args.arg | Where-Object {$_.Name -eq 'MethodBody'}).'#text'
+                    } else {
+                        #Unknown
+                        $DTListData += "Other detection method."
+                    }
+                    Write-HtmlList -InputObject $DTListData -Description $DTSection -Level 6 -File $FilePath
+
+                    $DTListData = @()
+                    $DTSection = "User Experience"
+                    switch (($DT.Installer.InstallAction.args.arg | Where-Object {$_.Name -eq 'ExecutionContext'}).'#text') {
+                        'System' { $InstallBehavior = 'Install for system' }
+                        'User' { $InstallBehavior = 'Install for user' }
+                        'Any' { $InstallBehavior = 'Install for system if resource is device; otherwise install for user' }
+                    }
+                    $DTListData += "Installation Behavior: $InstallBehavior"
+                    switch (($DT.Installer.InstallAction.args.arg | Where-Object {$_.Name -eq 'RequiresLogOn'}).'#text') {
+                        'True' { $LogonReq = 'Only when a user is logged on' }
+                        'False' { $LogonReq = 'Only when no user is logged on' }
+                        $null { $LogonReq = 'Whether or not a user is logged on' }
+                        default { $LogonReq = 'Whether or not a user is logged on' }
+                    }
+                    $DTListData += "Logon requirement: $LogonReq"
+                    switch (($DT.Installer.InstallAction.args.arg | Where-Object {$_.Name -eq 'UserInteractionMode'}).'#text') {
+                        'Normal' { $AppVisibility = 'Normal' }
+                        'Maximized' { $AppVisibility = 'Maximized' }
+                        'Minimized' { $AppVisibility = 'Minimized' }
+                        'Hidden' { $AppVisibility = 'Hidden' }
+                        Default { $AppVisibility = 'Normal'}
+                    }
+                    $DTListData += "Installation program visibility: $AppVisibility"
+                    if (($DT.Installer.InstallAction.args.arg | Where-Object {$_.Name -eq 'RequiresUserInteraction'}).'#text' -eq 'true'){
+                        $DTListData += "Allow user to view and interact with the program Installation: true"
+                    } else {
+                        $DTListData += "Allow user to view and interact with the program Installation: false"
+                    }
+                    $MaxRunTime = ($DT.Installer.InstallAction.args.arg | Where-Object {$_.Name -eq 'MaxExecuteTime'}).'#text'
+                    $DTListData += "Maximum allowed run time (minutes): $MaxRunTime"
+                    $EstimatedRunTime = ($DT.Installer.InstallAction.args.arg | Where-Object {$_.Name -eq 'ExecuteTime'}).'#text'
+                    $DTListData += "Estimated installation time (minutes): $EstimatedRunTime"
+                    switch (($DT.Installer.InstallAction.args.arg | Where-Object {$_.Name -eq 'PostInstallBehavior'}).'#text') {
+                        'BasedOnExitCode' { $CompletionBehavior = 'Determine behavior based on return codes' }
+                        'NoAction' { $CompletionBehavior = 'No specific action' }
+                        'ProgramReboot' { $CompletionBehavior = 'The Software install program might force a device restart' }
+                        'ForceReboot' { $CompletionBehavior = 'Configuration Manager client will force a mandatory device restart' }
+                        Default {}
+                    }
+                    $DTListData += "Installation Completion Behaviour: $CompletionBehavior"
+                    Write-HtmlList -InputObject $DTListData -Description $DTSection -Level 6 -File $FilePath
+
+                    $DTListData = @()
+                    $DTSection = "Requirements"
+                    If([string]::IsNullOrEmpty($DT.Requirements)){
+                        $DTListData += "No requirements defined."
+                    } else {
+                        #Any number of requirements
+                        $DTListData += "One or more requirements defined."
+                        If (!([string]::IsNullOrEmpty($DT.Requirements.Rule.OperatingSystemExpression))) {
+                            $Operator = $DT.Requirements.Rule.OperatingSystemExpression.Operator
+                            $OSes = $DT.Requirements.Rule.OperatingSystemExpression.Operands.RuleExpression.RuleId -join '; '
+                            $DTListData += "Operating system: &#60;$Operator&#62; $OSes"
                         }
                     }
-                    $DTListArray =@()
-                    #$DTsArray += New-Object -TypeName psobject -Property @{'Priority'= $DT.PriorityInLatestApp; 'Deployment Type Name' = "$($DT.LocalizedDisplayName)"; 'Technology' = "$($DT.Technology)"; 'Install Command' = "$InstallCL"; 'Uninstall Command' = "$UninstallCL"; 'Content Path' = "$Content"; 'Content Status'="$Verified"}
-                    #$DTsArray = New-Object -TypeName psobject -Property @{'Priority'= $DT.PriorityInLatestApp; 'Deployment Type Name' = $DT.LocalizedDisplayName; 'Technology' = $DT.Technology; 'Commandline' = if (-not ($DT.Technology -like 'AppV*')){ $xmlDT.AppMgmtDigest.DeploymentType.Installer.CustomData.InstallCommandLine } }
-                    $DTListTitle = "Deployment Type Name: $($DT.LocalizedDisplayName)"
-                    $DTListArray += "Deployment Type Priority: $($DT.PriorityInLatestApp)"
-                    $DTListArray += "Technology: $($DT.Technology)"
-                    $DTListArray += "Install Command: $InstallCL"
-                    $DTListArray += "Uninstall Command: $UninstallCL"
-                    $DTListArray += "Content Path: $Content"
-                    $DTListArray += "Content Status: $Verified"
-                    Write-HtmlList -Title $DTListTitle -InputObject $DTListArray -Level 5 -File $FilePath
-                    $InstallCL = ""
-                    $UninstallCL = ""
-                    $Content = ""
-                    $Verified = ""
+                    Write-HtmlList -InputObject $DTListData -Description $DTSection -Level 6 -File $FilePath
+                    
+                    $DTListData = @()
+                    $DTSection = "Return Codes"
+                    foreach ($XC in $DT.Installer.CustomData.ExitCodes.ExitCode) {
+                        $DTListData += "$($XC.Class) ($($XC.Code))"
+                    }
+                    Write-HtmlList -InputObject $DTListData -Description $DTSection -Level 6 -File $FilePath
+
+                    $DTListData = @()
+                    $DTSection = "Dependencies"
+                    If([string]::IsNullOrEmpty($DT.Dependencies)){
+                        $DTListData += "No dependencies defined."
+                    } else {
+                        #Any number of dependencies
+                        $DTListData += "One or more dependencies defined."
+                    }
+                    Write-HtmlList -InputObject $DTListData -Description $DTSection -Level 6 -File $FilePath
+                    
+                    $DTListData = @()
+                    $DTSection = "Install behavior - Executables that must be closed"
+                    If([string]::IsNullOrEmpty($DT.Installer.CustomData.InstallProcessDetection)){
+                        $DTListData += "No executables defined."
+                    } else {
+                        #Any number of dependencies
+                        foreach ($exe in $DT.Installer.CustomData.InstallProcessDetection.ProcessList.ProcessInformation){
+                            $DTListData += "$($exe.DisplayInfo.info.DisplayName) ($($exe.Name))"
+                        }
+                    }
+                    Write-HtmlList -InputObject $DTListData -Description $DTSection -Level 6 -File $FilePath
                 }
-                #$DTsArray = $DTsArray | sort Priority | Select-Object 'Priority','Deployment Type Name','Technology','Install Command','Uninstall Command','Content Path','Content Status'
-                #Write-HtmlTable -InputObject $DTsArray -Border 1 -Level 5 -File $FilePath
-                
             }
             else {
                 Write-HTMLParagraph -Text 'There are no Deployment Types configured for this Application.' -Level 5 -File $FilePath
             }
-            Write-Verbose "$(Get-Date):   Processing deployments for: $($App.LocalizedDisplayName)"
+            #endregion deployment types
+
+            #region deployments
+            Write-ProgressEx -CurrentOperation "Application: $($App.LocalizedDisplayName)" -Activity 'Configuration Manager Application' -Status 'Application deployments' -Id 10
             $AppDeployments = Get-CMApplicationDeployment -ApplicationID $($App.CI_ID)
             Write-HTMLHeading -Level 5 -Text "Deployments for $($App.LocalizedDisplayName):" -File $FilePath
             if (-not [string]::IsNullOrEmpty($AppDeployments)) {
                 $DeploymentsArray = @()
                 foreach ($AppDeployment in $AppDeployments){
+                    $AppDeploySettings = @()
                     Switch ($AppDeployment.DesiredConfigType){
                         1{$Action = 'Install'}
                         2{$Action = 'Remove'}
@@ -4893,39 +6701,136 @@ if ($ListAllInformation -or $ListAppDetails){
                         }
                     }
                     Switch ($AppDeployment.UseGMTTimes){
-                        True{$TimeZone = 'GMT'}
+                        True{$TimeZone = 'UTC'}
                         False{$TimeZone = 'Client Local Time'}
                     }
-                    $DeploymentsArray += New-Object -TypeName psobject -Property @{'Collection'="$($AppDeployment.CollectionName)";'Action'="$Action";'Purpose'="$Purpose";'User Notification'="$UserNotice";'Available Time'="$($AppDeployment.StartTime)";'Deadline'="$($AppDeployment.EnforcementDeadline)";'Time Zone'="$TimeZone"}
+                    $AppDeploySettings += '--B--User Experience--/B--'
+                    $AppDeploySettings += "--BULLET-- User notifications: $UserNotice"
+                    If($AppDeployment.OfferFlags -band 0x00000020){ #Bit 32 = HIGHIMPACTDEPLOYMENT
+                        $AppDeploySettings += '--TAB----CBOX-- When software changes are required, show a dialog window to the user instead of a toast notification'
+                    } else {
+                        $AppDeploySettings += '--TAB----UNCBOX-- When software changes are required, show a dialog window to the user instead of a toast notification'
+                    }
+                    $AppDeploySettings += '--BULLET-- Allow the following activies outside of maintinance windows:'
+                    if ($AppDeployment.OverrideServiceWindows -eq 'True'){
+                        $AppDeploySettings += '--TAB----CBOX-- Software Installation'
+                    } else {
+                        $AppDeploySettings += '--TAB----UNCBOX-- Software Installation'
+                    }
+                    if ($AppDeployment.RebootOutsideOfServiceWindows -eq 'True'){
+                        $AppDeploySettings += '--TAB----CBOX-- System Restart'
+                    } else {
+                        $AppDeploySettings += '--TAB----UNCBOX-- System Restart'
+                    }
+                    $AppDeploySettings += '--CRLF----B--Deployment Settings--/B--'
+                    If($AppDeployment.OfferFlags -band 0x00000008){ #Bit 8 = ALLOWUSERSTOREPAIRAPP
+                        $AppDeploySettings += '--CBOX-- Allow end users to attempt to repair this application'
+                    } else {
+                        $AppDeploySettings += '--UNCBOX-- Allow end users to attempt to repair this application'
+                    }
+                    If($AppDeployment.OfferFlags -band 0x00000001){ #Bit 1 = PREDEPLOY
+                        $AppDeploySettings += '--CBOX-- Pre-deploy software to the users primary device'
+                    } else {
+                        $AppDeploySettings += '--UNCBOX-- Pre-deploy software to the users primary device'
+                    }
+                    If($AppDeployment.RequireApproval -eq 'True'){
+                        $AppDeploySettings += '--CBOX-- An administrator must approve a request for this application on the device'
+                        $EmailSubscriptions = Get-CMAlertSubscription | Where-Object {(Get-CMAlert -TypeInstanceId "$($AppDeployment.AssignmentUniqueID)").ID -in $_.AlertIds}
+                        If ($EmailSubscriptions){
+                            $AppDeploySettings += "--CBOX-- Email Approvals: $($EmailSubscriptions.EmailAddress)"
+                        } else {
+                            $AppDeploySettings += "--UNCBOX-- Email Approvals"
+                        }
+                    } else {
+                        $AppDeploySettings += '--UNCBOX-- An administrator must approve a request for this application on the device'
+                    }
+                    If($AppDeployment.WoLEnabled -eq 'True'){
+                        $AppDeploySettings += '--CBOX-- Send wake-up packets'
+                    } else {
+                        $AppDeploySettings += '--UNCBOX-- Send wake-up packets'
+                    }
+                    If($AppDeployment.OfferFlags -band 0x00000004){ #Bit 4 = ENABLEPROCESSTERMINATION
+                        $AppDeploySettings += '--CBOX-- Automatically close any running executables you specified in Install Behavior'
+                    } else {
+                        $AppDeploySettings += '--UNCBOX-- Automatically close any running executables you specified in Install Behavior'
+                    }
+                    If($AppDeployment.OfferFlags -band 0x00000002){ #Bit 2 = ONDEMAND
+                        #'Use default distribution point group associated to this collection'
+                    }
+                    If($AppDeployment.OfferFlags -band 0x00000010){ #Bit 16 = RELATIVESCHEDULE
+                        #'RELATIVESCHEDULE?'
+                    }
+                    if ($AppDeployment.SoftDeadlineEnabled -eq 'True'){
+                        $AppDeploySettings += '--CRLF----CBOX-- Delay enforcement of this deployment according to user preferences, up to grace period..'
+                    } else {
+                        $AppDeploySettings += '--CRLF----UNCBOX-- Delay enforcement of this deployment according to user preferences, up to grace period..'
+                    }
+                    $AppDeploySettingsString = $AppDeploySettings -join '--CRLF--'
+                    $DeploymentsArray += New-Object -TypeName psobject -Property @{'Collection'="$($AppDeployment.CollectionName)";'Action'="$Action";'Purpose'="$Purpose";'Deployment Details'="$AppDeploySettingsString";'Available Time'="$($AppDeployment.StartTime)";'Deadline'="$($AppDeployment.EnforcementDeadline)";'Time Zone'="$TimeZone";'Deployment ID'="$($AppDeployment.AssignmentUniqueID)"}
                 }
-                $DeploymentsArray = $DeploymentsArray | Select-Object 'Collection','Action','Purpose','User Notification','Available Time','Deadline','Time Zone'
+                $DeploymentsArray = $DeploymentsArray | Select-Object 'Collection','Action','Purpose','Deployment Details','Available Time','Deadline','Time Zone','Deployment ID'
                 Write-HtmlTable -InputObject $DeploymentsArray -Border 1 -Level 6 -File $FilePath
             }else{
                 Write-HTMLParagraph -Text 'There are no deployments for this application.' -Level 6 -File $FilePath
             }
+            #endregion deployments
+
+            #region phaseddeployments
+            Write-ProgressEx -CurrentOperation "Application: $($App.LocalizedDisplayName)" -Activity 'Configuration Manager Application' -Status 'Application phased deployments' -Id 10
+            Write-HTMLHeading -Level 5 -Text "Phased Deployments for $($App.LocalizedDisplayName):" -File $FilePath
+            $PDs = @()
+            $PDs = Get-PWCMPhasedDeployment -DeploymentObjectID $($App.CI_ID) -SiteServer $SMSProvider -SiteName $SiteCode
+            if (-not [string]::IsNullOrEmpty($PDs)) {
+                foreach ($PD in $PDs){
+                    Write-HTMLHeading -Text $PD.Name -Level 6 -ExcludeTOC -File $FilePath
+                    Write-HTMLParagraph -Text "Description: $($PD.Description)" -Level 6 -File $FilePath
+                    $AppPhases = @()
+                    $AppPhases = Get-PWCMPDPhases -PhasedDeploymentID $PD.PhasedDeploymentID
+                    $AppPhasesArray = @()
+                    foreach ($Phase in $AppPhases){
+                        If ($Phase.SuccessCriteria.Number){
+                            $SuccessCriteria = "$($Phase.SuccessCriteria.Number) Computers"
+                        }
+                        If ($Phase.SuccessCriteria.Compliance){
+                            $SuccessCriteria = "$($Phase.SuccessCriteria.Compliance) Percent"
+                        }
+                        $AppPhasesArray += New-Object -TypeName psobject -Property @{'Order'=$Phase.Order;'Name'="$($Phase.Name)";'Target'="$($Phase.Target)";'Manual Start'="$($Phase.ManuallyStartPhase)";'Start After Previous Phase'="$($Phase.DaysAfterPrevPhaseSuccess) Days";'Gradually Available Over'="$($Phase.GraduallyAvailable) Days";'SuccessCriteria'="$SuccessCriteria"}
+                        Remove-Variable SuccessCriteria -ErrorAction Ignore
+                    }
+                    $AppPhasesArray = $AppPhasesArray |Select-Object 'Order','Name','Target','Manual Start','Start After Previous Phase','Gradually Available Over','SuccessCriteria'
+                    Write-HtmlTable -InputObject $AppPhasesArray -Border 1 -Level 6 -File $FilePath
+                    Remove-Variable AppPhasesArray -ErrorAction Ignore
+                    Remove-Variable AppPhases -ErrorAction Ignore
+                }
+            }else{
+                Write-HTMLParagraph -Text 'There are no phased deployments for this application.' -Level 6 -File $FilePath
+            }
+            #endregion phaseddeployments
+
         }
     }else{
         Write-HTMLParagraph -Text 'There are no Applications configured in this site.' -Level 4 -File $FilePath
     }
+    Write-ProgressEx -CurrentOperation "Completed applications" -Activity 'Configuration Manager Application' -Status 'Application details' -Id 10 -Completed
 }
 elseif (-not [string]::IsNullOrEmpty($Applications)) {
     Write-HTMLParagraph -Text "There are $($Applications.count) applications configured." -Level 4 -File $FilePath
     $AppBasics = @()
     foreach ($App in $Applications){
-        $AppBasics += New-Object -TypeName PSObject -Property @{'Name'="$($App.LocalizedDisplayName)"; 'Created by' = $($App.CreatedBy); 'Date created'=$($App.DateCreated)}
+        $AppBasics += New-Object -TypeName PSObject -Property @{'Name'="$($App.LocalizedDisplayName)"; 'Deployed' = $($App.IsDeployed); 'Created by' = $($App.CreatedBy); 'Date created'=$($App.DateCreated)}
     }
-    $AppBasics = $AppBasics | Select 'Name','Created by','Date Created'
+    $AppBasics = $AppBasics | Select-Object 'Name','Deployed','Created by','Date Created'
     Write-HtmlTable -InputObject $AppBasics -Border 1 -Level 4 -File $FilePath
 }
 else {
     Write-HTMLParagraph -Text 'There are no Applications configured in this site.' -Level 4 -File $FilePath
 }
-Write-Verbose "$(Get-Date):   Applications Complete."
+Write-ProgressEx -CurrentOperation "Applications Complete"
 Write-HtmliLink -ReturnTOC -File $FilePath
 #endregion Applications
 
 #region Packages
-Write-Verbose "$(Get-Date):   Processing Packages."
+Write-ProgressEx -CurrentOperation "Processing Packages"
 Write-HTMLHeading -PageBreak -Level 3 -Text 'Packages' -File $FilePath
 $Packages = Get-CMPackage
 if ($ListAllInformation){
@@ -4933,7 +6838,7 @@ if ($ListAllInformation){
         Write-HTMLParagraph -Text "There are $($Packages.count) packages configured." -Level 5 -File $FilePath
         Write-HTMLParagraph -Text "Below is a summary of all $($Packages.count) packages defined in this site. These are applications that are installed using traditional packages." -Level 3 -File $FilePath
         foreach ($Package in $Packages) {
-            Write-Verbose "$(Get-Date):   Found Package: $($Package.Name)"
+            Write-Debug "$(Get-Date):   Found Package: $($Package.Name)"
             Write-HTMLHeading -Level 4 -Text "$($Package.Name)" -File $FilePath
             $PackageDetailList = @()
             $PackageDetailList += "Description: $($Package.Description)"
@@ -4949,7 +6854,7 @@ if ($ListAllInformation){
             Write-HtmlList -InputObject $PackageDetailList -Level 5 -File $FilePath
             Write-HTMLHeading -Level 6 -Text 'The Package has the following Programs configured:' -File $FilePath
             $Programs = Get-WmiObject -Class SMS_Program -Namespace root\sms\site_$SiteCode -ComputerName $SMSProvider -Filter "PackageID = '$($Package.PackageID)'"
-            Write-Verbose "$(Get-Date):   Getting programs in package $($Package.Name)..."
+            Write-Debug "$(Get-Date):   Getting programs in package $($Package.Name)..."
             if (-not [string]::IsNullOrEmpty($Programs)){
                 foreach ($Program in $Programs){
                     $ProgramList = @()
@@ -5030,7 +6935,7 @@ if ($ListAllInformation){
                     Write-HtmlList -Title $ProgramTitle -InputObject $ProgramList -Level 6 -File $FilePath
                 }
             }else{
-                Write-Verbose "$(Get-Date):   No programs found in package $($Package.Name)..."
+                Write-Debug "$(Get-Date):   No programs found in package $($Package.Name)..."
                 Write-HTMLParagraph -Text 'The Package has no Programs configured.' -Level 6 -File $FilePath
             }                       
         }
@@ -5044,34 +6949,38 @@ elseif (-not [string]::IsNullOrEmpty($Packages)){
     foreach ($Package in $Packages){
         $PackageBasics += New-Object -TypeName PSObject -Property @{'Name'="$($Package.Name)"; 'Programs' = $($Package.NumOfPrograms); 'Content Date'=$($Package.SourceDate)}
     }
-    $PackageBasics = $PackageBasics | Select 'Name','Programs','Content Date'
+    $PackageBasics = $PackageBasics | Select-Object 'Name','Programs','Content Date'
     Write-HtmlTable -InputObject $PackageBasics -Border 1 -Level 4 -File $FilePath
 }else{
     Write-HTMLParagraph -Text 'There are no packages configured in this site.' -Level 5 -File $FilePath
 }
-Write-Verbose "$(Get-Date):   Completed processing Packages."
+Write-ProgressEx -CurrentOperation "Completed processing Packages"
 #endregion Packages
 Write-HtmliLink -ReturnTOC -File $FilePath
 #endregion Application Management
 
 
 #region Software Updates
+Write-ProgressEx -CurrentOperation 'Software Updates' 
 Write-HTMLHeading -Level 2 -PageBreak -Text 'Software Updates' -File $FilePath
 
 #region Update Groups
+Write-ProgressEx -CurrentOperation 'Software Update groups' 
 Write-HTMLHeading -Level 3 -PageBreak -Text 'Software Update Groups' -File $FilePath
 $UpdateGroups = Get-CMSoftwareUpdateGroup
 If(-not [string]::IsNullOrEmpty($UpdateGroups)){
     Write-HTMLParagraph -Text "There are $($UpdateGroups.count) update groups defined in this site." -Level 3 -File $FilePath
-    $UGs = $UpdateGroups|Sort LocalizedDisplayName|Select @{Name='Group Name';expression={$_.LocalizedDisplayName}},@{Name='ID';expression={$_.CI_ID}},@{Name='Update Count';expression={$_.NumberOfUpdates}},@{Name='Expired Updates';expression={$_.NumberOfExpiredUpdates}},@{Name='Created By';expression={$_.CreatedBy}},@{Name='Date Created';expression={$_.DateCreated}},@{Name='Deployed';expression={$_.IsDeployed}},@{Name='Compliance';expression={"$($_.PercentCompliant)%"}}
+    $UGs = $UpdateGroups|Sort-Object LocalizedDisplayName|Select-Object @{Name='Group Name';expression={$_.LocalizedDisplayName}},@{Name='ID';expression={$_.CI_ID}},@{Name='Update Count';expression={$_.NumberOfUpdates}},@{Name='Expired Updates';expression={$_.NumberOfExpiredUpdates}},@{Name='Created By';expression={$_.CreatedBy}},@{Name='Date Created';expression={$_.DateCreated}},@{Name='Deployed';expression={$_.IsDeployed}},@{Name='Compliance';expression={"$($_.PercentCompliant)%"}}
     Write-HtmlTable -InputObject $UGs -Border 1 -Level 3 -File $FilePath
 }else{
     Write-HTMLParagraph -Text "There are no update groups defined in this site." -Level 3 -File $FilePath
 }
 Write-HtmliLink -ReturnTOC -File $FilePath
+Write-ProgressEx -CurrentOperation 'Completed Software Update groups'
 #endregion Update Groups
 
 #region Update Packages
+Write-ProgressEx -CurrentOperation 'Software Update packages'
 Write-HTMLHeading -Level 3 -PageBreak -Text 'Software Update Packages' -File $FilePath
 $UpdatePackages=Get-CMSoftwareUpdateDeploymentPackage
 If(-not [string]::IsNullOrEmpty($UpdatePackages)){
@@ -5094,32 +7003,37 @@ If(-not [string]::IsNullOrEmpty($UpdatePackages)){
         }
         $SUPackages += New-Object -TypeName PSObject -Property @{'Name'="$Name";'Package ID'="$PackageID";'BDR'="$BDR";'Source Path'="$SourcePath";'Source Status'="$SourceStatus"}
     }
-    $SUPackages= $SUPackages|Sort Name|Select-Object 'Name','Package ID','BDR','Source Path','Source Status'
+    $SUPackages= $SUPackages|Sort-Object Name|Select-Object 'Name','Package ID','BDR','Source Path','Source Status'
     Write-HtmlTable -InputObject $SUPackages -Border 1 -Level 3 -File $FilePath
     Write-HTMLParagraph -Text '(BDR = Binary Differential Replication)' -Level 4 -File $FilePath
 }else{
     Write-HTMLParagraph -Text "There are no update packages defined in this site." -Level 3 -File $FilePath
 }
 Write-HtmliLink -ReturnTOC -File $FilePath
+Write-ProgressEx -CurrentOperation 'Completed Software Update packages'
 #endregion Update Packages
 
 
 #region ADRs
-Write-Verbose "$(Get-Date):   Beginning processing of ADRs..."
+Write-ProgressEx -CurrentOperation 'Processing Automatic Deployment Rules'
 Write-HTMLHeading -Level 3 -PageBreak -Text 'Automatic Deployment Rules' -File $FilePath
 $CMPSSuppressFastNotUsedCheck = $true
 $ADRs=Get-CMSoftwareUpdateAutoDeploymentRule
 foreach ($ADR in $ADRs){
-    Write-Verbose "$(Get-Date):   Processing ADR $($ADR.Name)"
+    Write-ProgressEx -CurrentOperation "Processing ADR $($ADR.Name)" -Activity 'Automatic Deployment Rules' -Status 'Collecting details' -Id 11
     $ADRListDetails = @()
-    $ADRListTitle = "Name: $($ADR.Name)"
+    #$ADRListTitle = "Name: $($ADR.Name)"
     Write-HTMLHeading -Level 4 -Text "$($ADR.Name)" -File $FilePath
     $ADRListDescription = $ADR.Description
     Remove-Variable languages -ErrorAction SilentlyContinue
     foreach ($locale in ([xml]$adr.ContentTemplate).ContentActionXML.ContentLocales.Locale){
         if ($locale -ne 'Locale:0'){$languages = "$languages, $((Get-CMCategory -Id $locale).LocalizedCategoryInstanceName)"}
     }
-    $ADRListDetails += "Languages: $($languages.Trim(', '))"
+    If ($Null -ne $languages){
+        $ADRListDetails += "Languages: $($languages.Trim(', '))"
+    } else {
+        $ADRListDetails += "Languages: N/A"
+    }
     If (-not [string]::IsNullOrEmpty($ADR.Schedule)){
         $Schedule=Convert-CMSchedule $ADR.Schedule
         if ($Schedule.DaySpan -gt 0){
@@ -5149,7 +7063,11 @@ foreach ($ADR in $ADRs){
                     3 {$order = 'third'}
                     4 {$order = 'fourth'}
                 }
-                $ADRListDetails += "Evaluation Schedule: Occurs the $($order) $(Convert-WeekDay $Schedule.Day) of every $($Schedule.ForNumberOfMonths) months effective $($Schedule.StartTime)"
+                If ($Schedule.OffsetDay){
+                    $ADRListDetails += "Evaluation Schedule: Occurs $($Schedule.OffsetDay) days after the $($order) $(Convert-WeekDay $Schedule.Day) of every $($Schedule.ForNumberOfMonths) months effective $($Schedule.StartTime)"
+                }else{
+                    $ADRListDetails += "Evaluation Schedule: Occurs the $($order) $(Convert-WeekDay $Schedule.Day) of every $($Schedule.ForNumberOfMonths) months effective $($Schedule.StartTime)"
+                }
             }
         }
     }else{
@@ -5159,7 +7077,7 @@ foreach ($ADR in $ADRs){
     Remove-Variable Categories -ErrorAction SilentlyContinue
     Add-Type -AssemblyName System.Web
     $UpdateRuleList = @()
-    Write-Verbose "$(Get-Date):   Getting a list of configured update rules for this ADR: $($ADR.Name)"
+    Write-Debug "$(Get-Date):   Getting a list of configured update rules for this ADR: $($ADR.Name)"
     foreach ($UpdateRule in $rules.UpdateXML.UpdateXMLDescriptionItems.UpdateXMLDescriptionItem){
         Switch($UpdateRule.PropertyName){
             '_Product'{
@@ -5257,7 +7175,7 @@ foreach ($ADR in $ADRs){
                 $UpdateRuleList += [System.Web.HttpUtility]::HtmlEncode("$UTitle")
             }
             '_Company'{
-                $Vendors = @()
+                #$Vendors = @()
                 foreach ($Vendor in $UpdateRule.MatchRules.string.Trim("'")){
                     $Vend = Get-WmiObject -Namespace ROOT\SMS\site_$SiteCode -Query "SELECT LocalizedCategoryInstanceName FROM SMS_CIAllCategories WHERE CategoryTypeName=`'Company`' and CategoryInstance_UniqueID=`'$Vendor`'" -ComputerName $SMSProvider
                     $UpdateVendor += $Vend[0].LocalizedCategoryInstanceName
@@ -5268,13 +7186,20 @@ foreach ($ADR in $ADRs){
         }
     }
     $ADRDeployments = Get-CMSoftwareUpdateAutoDeploymentRuleDeployment -ID $ADR.AutoDeploymentID
-    $DeploymentPackage = Get-CMSoftwareUpdateDeploymentPackage -Id ([xml]$adr.ContentTemplate).ContentActionXML.PackageID
-    $Package = New-Object -TypeName PSObject -Property @{'Package Name'="$($DeploymentPackage.Name)";'Description'="$($DeploymentPackage.Description)";'Package ID'="$($DeploymentPackage.PackageID)";'Source Location'="$($DeploymentPackage.PkgSourcePath)"}
-    $Package = $package | Select-Object 'Package Name','Package ID','Description','Source Location'
+    Remove-Variable Package -ErrorAction Ignore
+    If ($null -ne ([xml]$adr.ContentTemplate).ContentActionXML.PackageID){
+        $DeploymentPackage = Get-CMSoftwareUpdateDeploymentPackage -Id ([xml]$adr.ContentTemplate).ContentActionXML.PackageID
+        $Package = New-Object -TypeName PSObject -Property @{'Package Name'="$($DeploymentPackage.Name)";'Description'="$($DeploymentPackage.Description)";'Package ID'="$($DeploymentPackage.PackageID)";'Source Location'="$($DeploymentPackage.PkgSourcePath)"}
+        $Package = $package | Select-Object 'Package Name','Package ID','Description','Source Location'
+    } else {
+        $UpdateRuleList += 'No software update package defined in this ADR.'
+    }
     Write-HtmlList -InputObject $ADRListDetails -Description $ADRListDescription -Level 3 -File $FilePath
     #$UpdateRuleList
     Write-HtmlList -InputObject $UpdateRuleList -Description 'Software Update Property Filters (Update Rules):' -Level 3 -File $FilePath
-    Write-HtmlTable -InputObject $Package -Level 5 -File $FilePath
+    If ($Package){
+        Write-HtmlTable -InputObject $Package -Level 5 -File $FilePath
+    }
     Write-HTMLHeading -Level 5 -Text "Deployments for ADR: $($ADR.Name)" -File $FilePath
     If ($ListAllInformation){
         Foreach ($Deployment in $ADRDeployments){
@@ -5349,11 +7274,12 @@ foreach ($ADR in $ADRs){
             #$DTxml
         }
     }Else{
-        Write-HtmlTable -InputObject ($ADRDeployments|select @{Name='Collection';expression={$_.CollectionName}},Enabled) -Level 5 -File $FilePath
+        Write-HtmlTable -InputObject ($ADRDeployments|Select-Object @{Name='Collection';expression={$_.CollectionName}},Enabled) -Level 5 -File $FilePath
     }
 }
 Write-HtmliLink -ReturnTOC -File $FilePath
-Write-Verbose "$(Get-Date):   Completed processing of ADRs."
+Write-ProgressEx -CurrentOperation 'Completed Processing ADRs' -Activity 'Automatic Deployment Rules' -Status 'Collecting details' -Id 11 -Completed
+Write-ProgressEx -CurrentOperation 'Completed processing of ADRs'
 #endregion ADRs
 
 
@@ -5361,10 +7287,11 @@ Write-Verbose "$(Get-Date):   Completed processing of ADRs."
 
 
 #region Operating Systems
+Write-ProgressEx -CurrentOperation 'Operating Systems'
 Write-HTMLHeading -Level 2 -PageBreak -Text 'Operating Systems' -File $FilePath
 
 #region Driver Packages
-Write-Verbose "$(Get-Date):   Processing Driver Packages."
+Write-ProgressEx -CurrentOperation 'Processing Driver Packages'
 Write-HTMLHeading -Level 3 -PageBreak -Text 'Driver Packages' -File $FilePath
 $DriverPackages = Get-CMDriverPackage
 if ($ListAllInformation){
@@ -5386,15 +7313,15 @@ if ($ListAllInformation){
             }
             $DPackArray += "Source Files exist: $Verified"
             $DPackArray += 'This package consists of the following Drivers:'
-            If ($PackageDescription){
+            If (-not [string]::IsNullOrEmpty($PackageDescription)){
                 Write-HtmlList -Title $PackageName -Description $PackageDescription -InputObject $DPackArray -Level 4 -File $FilePath
             }else{
                 Write-HtmlList -Title $PackageName -InputObject $DPackArray -Level 4 -File $FilePath
             }
-            Write-Verbose "$(Get-Date):   Getting Drivers in Package: $PackageName"
+            Write-Debug "$(Get-Date):   Getting Drivers in Package: $PackageName"
             $Drivers = @(Get-CMDriver -DriverPackageId "$($DriverPackage.PackageID)")
             if ($Drivers.Count -gt 0){
-                Write-Verbose "$(Get-Date):   Drivers found in package. Processing the drivers"
+                Write-Debug "$(Get-Date):   Drivers found in package. Processing the drivers"
                 $DriverArray = @()
                 foreach ($Driver in $Drivers){
                     if (Test-Path "filesystem::$($Driver.ContentSourcePath)" -ErrorAction SilentlyContinue){
@@ -5446,12 +7373,12 @@ if ($ListAllInformation){
         Write-HTMLParagraph -Text 'There are no Driver Packages configured in this site.' -Level 4 -File $FilePath
     }
 }
-Write-Verbose "$(Get-Date):   Completed processing Driver Packages."
+Write-ProgressEx -CurrentOperation 'Completed processing Driver Packages'
 Write-HtmliLink -ReturnTOC -File $FilePath
 #endregion Driver Packages
 
 #region Operating System Upgrade Packages
-Write-Verbose "$(Get-Date):   Processing Operating System Upgrade Packages."
+Write-ProgressEx -CurrentOperation 'Processing Operating System Upgrade Packages'
 Write-HTMLHeading -Level 3 -PageBreak -Text 'Operating System Upgrade Packages' -File $FilePath
 $OSUgPacks = Get-CMOperatingSystemInstaller
 if (-not [string]::IsNullOrEmpty($OSUgPacks)){
@@ -5465,7 +7392,7 @@ if (-not [string]::IsNullOrEmpty($OSUgPacks)){
                     {
                         $UgPackDescription = "Description/Comment: $($OSUpgradePack.Description)"
                     }
-            $UgPackList += "Version: $($OSUpgradePack.PackageID)"
+            $UgPackList += "Version: $($OSUpgradePack.Version)"
             $UgPackList += "Language: $($OSUpgradePack.Language)"
             $UgPackList += "Image OS Version: $($OSUpgradePack.ImageOSVersion)"
             $UgPackList += "Package ID: $($OSUpgradePack.PackageID)"
@@ -5485,12 +7412,12 @@ if (-not [string]::IsNullOrEmpty($OSUgPacks)){
 }else{
     Write-HTMLParagraph -Text 'There are no Operating System Upgrade Packages found in this site.' -Level 4 -File $FilePath
 }
-Write-Verbose "$(Get-Date):   Completed processing Operating System Upgrade Packages."
+Write-ProgressEx -CurrentOperation 'Completed Operating System Upgrade Packages'
 Write-HtmliLink -ReturnTOC -File $FilePath
 #endregion Operating System Upgrade Packages
 
 #region Operating System Images
-Write-Verbose "$(Get-Date):   Processing Operating System Images."
+Write-ProgressEx -CurrentOperation 'Processing Operating System Images'
 Write-HTMLHeading -Level 3 -PageBreak -Text 'Operating System Images' -File $FilePath
 $OSImages = Get-CMOperatingSystemImage
 if (-not [string]::IsNullOrEmpty($OSImages)){
@@ -5524,12 +7451,12 @@ if (-not [string]::IsNullOrEmpty($OSImages)){
 }else{
     Write-HTMLParagraph -Text 'There are no Operating System Images found in this site.' -Level 4 -File $FilePath
 }
-Write-Verbose "$(Get-Date):   Completed processing Operating System Images."
+Write-ProgressEx -CurrentOperation 'Completed Operating System Images'
 Write-HtmliLink -ReturnTOC -File $FilePath
 #endregion Operating System Images
 
 #region Boot Images
-Write-Verbose "$(Get-Date):   Processing Boot Images."
+Write-ProgressEx -CurrentOperation 'Processing Boot Images'
 Write-HTMLHeading -Level 3 -PageBreak -Text 'Boot Images' -File $FilePath
 $BootImages = Get-CMBootImage
 if (-not [string]::IsNullOrEmpty($BootImages)){
@@ -5630,20 +7557,20 @@ if (-not [string]::IsNullOrEmpty($BootImages)){
     Write-HTMLParagraph -Text 'There are no Boot Images present in this site.' -Level 4 -File $FilePath
 }
 Remove-Variable BootImage -ErrorAction Ignore
-Write-Verbose "$(Get-Date):   Completed processing Boot Images."
+Write-ProgressEx -CurrentOperation 'Completed Boot Images'
 Write-HtmliLink -ReturnTOC -File $FilePath
 #endregion Boot Images
 
 
 #region Task Sequences
-Write-Verbose "$(Get-Date):   Enumerating Task Sequences"
+Write-ProgressEx -CurrentOperation 'Processing Task Sequences'
 Write-HTMLHeading -Level 3 -PageBreak -Text 'Task Sequences' -File $FilePath
 $TaskSequences = Get-CMTaskSequence
-Write-Verbose "$(Get-Date):   working on $($TaskSequences.count) Task Sequences"
+Write-Debug "$(Get-Date):   working on $($TaskSequences.count) Task Sequences"
 if ($ListAllInformation){
     if (-not [string]::IsNullOrEmpty($TaskSequences)){
         foreach ($TaskSequence in $TaskSequences){
-                Write-Verbose "$(Get-Date):   Detailing $($TaskSequence.Name) Task Sequences"
+                Write-ProgressEx -CurrentOperation "Detailing $($TaskSequence.Name) Task Sequences" -Activity 'Processing Task Seqeunce' -Status 'Collecting Steps' -Id 12
                 Write-HTMLHeading -Level 4 -Text "$($TaskSequence.Name)" -File $FilePath
                 $TSDetails = @()
                 $TSDetails += "Package ID: $($TaskSequence.PackageID)"
@@ -5653,7 +7580,7 @@ if ($ListAllInformation){
                 }else{
                     $BootImage = (Get-CMBootImage -id $TSBootImage -ErrorAction Ignore).Name
                 }
-                Write-Verbose "$(Get-Date):   Task Sequence Boot Image: $BootImage"
+                Write-Debug "$(Get-Date):   Task Sequence Boot Image: $BootImage"
                 $TSDetails += "Task Sequence Boot Image: $BootImage"
                 $TSRefs = $TaskSequence.References.Package
                 $OSImages = Get-CMOperatingSystemImage
@@ -5668,17 +7595,67 @@ if ($ListAllInformation){
                     }
                 }
                 If([string]::IsNullOrEmpty($TSOSImage)){$TSOSImage="None"}
-                Write-Verbose "$(Get-Date):   Task Sequence Operating System Image: $TSOSImage"
+                Write-Debug "$(Get-Date):   Task Sequence Operating System Image: $TSOSImage"
                 $TSDetails += "Task Sequence Operating System Image: $TSOSImage"
-                $TSDetails += "Sequence Steps:"
+                #Task Sequence References
+                $TSReferences = Get-WmiObject -Namespace "Root\SMS\site_$($SiteCode)" -Query "SELECT * FROM SMS_TaskSequencePackageReference_Flat where PackageID = `'$($TaskSequence.PackageID)`'" -ComputerName $SMSProvider
+                $TotalSize = 0
+                $TotalTsRefs = 0
+                $TotalTsRefs = $TSReferences.count
+                $TSRefInfo = @()
+                foreach($ref in $TSReferences){
+                    switch ($ref.ObjectType){
+                        0 {
+                            $PackageType = "Package"
+                        }
+                        3 {
+                            $PackageType = "Driver Package"
+                        }
+                        4 {
+                            $PackageType = "Task Sequence"
+                        }
+                        257{
+                            $PackageType = "OS Image"
+                        }
+                        258{
+                            $PackageType = "Boot Image"
+                        }
+                        259{
+                            $PackageType = "OS Upgrade Package"
+                        }
+                        512{
+                            $PackageType = "Application"
+                        }
+                        default{
+                            $PackageType = $ref.ObjectType
+                        }
+                    }
+                    $SizeMB = [math]::Round($ref.SourceSize/1024)
+                    $TotalSize = $TotalSize + $SizeMB
+                    If ($SizeMB -eq 0){
+                        $SizeMB = "<1 MB"
+                    } else {
+                        $SizeMB = "$SizeMB MB"
+                    }
+                    $TSRefInfo += New-Object -TypeName PSObject -Property @{'Name'="$($ref.ObjectName)";'Type'="$PackageType";'Package ID'="$($ref.RefPackageID)";'Size'="$SizeMB"}
+                }
+                $TSRefInfo = $TSRefInfo|Select-Object Type,Name,'Package ID',Size
                 Write-HtmlList -InputObject $TSDetails -Level 4 -File $FilePath
+                Write-HTMLHeading -Level 5 -Text "Task Sequence References" -File $FilePath
+                Write-HtmlList -InputObject @("This task sequence references $TotalTsRefs packages.","The referenced packages total $TotalSize MB.") -Level 4 -File $FilePath
+                If ($TotalTsRefs -ne 0){Write-HtmlTable -InputObject $TSRefInfo -Border 1 -Level 6 -File $FilePath}
+                Write-HTMLHeading -Level 5 -Text "Task Sequence Steps" -File $FilePath
                 $Sequence = $Null
                 $Sequence = ([xml]$TaskSequence.Sequence).sequence
                 $AllSteps = Process-TSSteps -Sequence $Sequence
                 $c = 0
                 foreach ($Step in $AllSteps){$c++;$Step|Add-Member -MemberType NoteProperty -Name 'Step' -Value $c}
                 $AllSteps = $AllSteps |Select-Object 'Step','Group Name','Step Name','Description','Action','Status','Continue on Error','Conditions'
-                Write-HtmlTable -InputObject $AllSteps -Border 1 -Level 6 -File $FilePath
+                If ($AllSteps.count -gt 0){
+                    Write-HtmlTable -InputObject $AllSteps -Border 1 -Level 6 -File $FilePath
+                }else{
+                    Write-HtmlList -InputObject "This task sequence contains no steps" -Level 4 -File $FilePath
+                }
                 Remove-Variable TSOSImage -ErrorAction Ignore
                 Remove-Variable BootImage -ErrorAction Ignore
             }
@@ -5696,20 +7673,20 @@ if ($ListAllInformation){
             }else{
                 foreach ($Ref in $TSRefs){
                     If($Ref -in $OSImages.PackageID){
-                        Write-Verbose "$(Get-Date):   (Get-CMOperatingSystemImage -id $($Ref)).Name"
+                        Write-Debug "$(Get-Date):   (Get-CMOperatingSystemImage -id $($Ref)).Name"
                         $TSOSImage = (Get-CMOperatingSystemImage -id $Ref).Name
                     }
                 }
             }
             If([string]::IsNullOrEmpty($TSOSImage)){$TSOSImage="None"}
-            Write-Verbose "$(Get-Date):   Task Sequence Operating System Image: $TSOSImage"
+            Write-Debug "$(Get-Date):   Task Sequence Operating System Image: $TSOSImage"
             $TSBootImage = $TaskSequence.BootImageID
             If([string]::IsNullOrEmpty($TSBootImage)){
                 $BootImage = "None"
             }else{
                 $BootImage = (Get-CMBootImage -id $TSBootImage -ErrorAction Ignore).Name
             }
-            Write-Verbose "$(Get-Date):   Task Sequence Boot Image: $BootImage"
+            Write-Debug "$(Get-Date):   Task Sequence Boot Image: $BootImage"
             $TSName = "$($TaskSequence.Name)"
             $TSList += New-Object -TypeName PSObject -Property @{'Name'="$TSName";'Operating System Image'="$TSOSImage";'Boot Image'="$BootImage"}
         }
@@ -5719,17 +7696,19 @@ if ($ListAllInformation){
         Write-HTMLParagraph -Level 3 -Text 'There are no Task Sequences present in this environment.' -File $FilePath
     }
 }
-Write-Verbose "$(Get-Date):   Completed Task Sequences"
+Write-ProgressEx -CurrentOperation "Task Sequence details complete" -Activity 'Processing Task Seqeunce' -Status 'Collecting Steps' -Id 12 -Completed
+Write-ProgressEx -CurrentOperation "Completed Task Sequences"
 Write-HtmliLink -ReturnTOC -File $FilePath
 #endregion Task Sequences
 
 #endregion Operating Systems
 
 #region Windows 10 Servicing
+Write-ProgressEx -CurrentOperation 'Windows 10 Servicing'
 Write-HTMLHeading -Level 2 -PageBreak -Text 'Windows 10 Servicing' -File $FilePath
 
 #region Servicing Plan
-Write-Verbose "$(Get-Date):   Enumerating Windows 10 Servicing Plans"
+Write-ProgressEx -CurrentOperation 'Windows 10 Servicing Plans'
 Write-HTMLHeading -Level 3 -Text 'Servicing Plans' -File $FilePath
 $CMPSSuppressFastNotUsedCheck = $true
 $ServicingPlans = Get-CMWindowsServicingPlan -WarningAction Ignore
@@ -5762,7 +7741,7 @@ if(-not [string]::IsNullOrEmpty($ServicingPlans)){
 	        0{$DeployBranch="Semi-Annual Channel (Targeted)"}
 	        1{$DeployBranch="Semi-Annual Channel"}
         }
-        $WaitDays = (((([xml]($ServicingPlan).UpdateRuleXML).UpdateXML.UpdateXMLDescriptionItems.UpdateXMLDescriptionItem| where {$_.PropertyName -eq 'AfterDays'}).Matchrules.string).Split(':'))[2]
+        $WaitDays = (((([xml]($ServicingPlan).UpdateRuleXML).UpdateXML.UpdateXMLDescriptionItems.UpdateXMLDescriptionItem| Where-Object {$_.PropertyName -eq 'AfterDays'}).Matchrules.string).Split(':'))[2]
         $SPListDetails += "Specify the Windows readiness state to which this Servicing Plan should apply: $DeployBranch"
         $SPListDetails += "How many days after Microsoft has published a new upgrade would you like to wait before deploying in your environment: $WaitDays"
         Write-HtmlList -Description 'Deployment Ring' -InputObject $SPListDetails -Level 4 -File $FilePath
@@ -5873,14 +7852,14 @@ if(-not [string]::IsNullOrEmpty($ServicingPlans)){
     Write-HTMLParagraph -Text 'No servicing plans defined in this site.' -Level 3 -File $FilePath
 }
 
-Write-Verbose "$(Get-Date):   Completed Enumerating Windows 10 Servicing Plans"
+Write-ProgressEx -CurrentOperation 'Completed Windows 10 Servicing Plans'
 #endregion Servicing Plan
 
 #region Windows Update for Business Policies
-Write-Verbose "$(Get-Date):   Enumerating Windows Update for Business Policies"
+Write-ProgressEx -CurrentOperation 'Windows Update for Business Policies'
 Write-HTMLHeading -Level 3 -Text 'Windows Update for Business Policies' -File $FilePath
 Write-HTMLParagraph -Text 'Below are details on all Windows Update for Business Policies defined in this site.' -Level 3 -File $FilePath
-$WUBPolicies = Get-CMConfigurationPolicy | where {'SettingsAndPolicy:SMS_WindowsUpdateForBusinessConfigurationSettings' -in $_.CategoryInstance_UniqueIDs}
+$WUBPolicies = Get-CMConfigurationPolicy | Where-Object {'SettingsAndPolicy:SMS_WindowsUpdateForBusinessConfigurationSettings' -in $_.CategoryInstance_UniqueIDs}
 if(-not [string]::IsNullOrEmpty($WUBPolicies)){
     foreach($WUBPolicy in $WUBPolicies){
         Remove-Variable rules -ErrorAction Ignore
@@ -5933,25 +7912,26 @@ if(-not [string]::IsNullOrEmpty($WUBPolicies)){
 }else{
     Write-HTMLParagraph -Text 'No Windows Update for Business Policies defined in this site.' -Level 3 -File $FilePath
 }
-Write-Verbose "$(Get-Date):   Completed Enumerating Windows Update for Business Policies"
+Write-ProgressEx -CurrentOperation 'Completed Windows Update for Business Policies'
 
 #endregion Windows Update for Business Policies
 
+Write-ProgressEx -CurrentOperation 'Completed Windows 10 Servicing'
 #endregion Windows 10 Servicing
 
 #region Scripts
-Write-Verbose "$(Get-Date):   Enumerating Configuration Manager Scripts"
+Write-ProgressEx -CurrentOperation 'Collecting Configuration Manager Scripts'
 Write-HTMLHeading -Level 2 -PageBreak -Text 'Configuration Manager Scripts' -File $FilePath
-$ScriptFeature = Get-CMSiteFeature|where{$_.FeatureGuid -like '566F8720-F415-4E10-9A51-CDE682BA2B2E'}
+$ScriptFeature = Get-CMSiteFeature| Where-Object {$_.FeatureGuid -like '566F8720-F415-4E10-9A51-CDE682BA2B2E'}
 if (-not [string]::IsNullOrEmpty($ScriptFeature)){
     If ($ScriptFeature.Status -eq 1){
         $CMScripts = Get-WmiObject -Namespace ROOT\SMS\site_$SiteCode -ComputerName $SMSProvider -Class SMS_Scripts
-        Write-Verbose "$(Get-Date):   Working on $($CMScripts.count) Scripts"
+        Write-Debug "$(Get-Date):   Working on $($CMScripts.count) Scripts"
         if ([string]::IsNullOrEmpty($CMScripts)){
             Write-HTMLParagraph -Text "No Scripts are defined in this site." -Level 3 -File $FilePath
         }else{
             if ($ListAllInformation){
-                Write-Verbose "$(Get-Date):   Working on detailed script information"
+                Write-Debug "$(Get-Date):   Working on detailed script information"
                 #Detailed Script Information
                 foreach ($Script in $CMScripts){
                     #Exclude scripts with feature set to 1. These are system scripts like CMPivot.
@@ -5993,7 +7973,11 @@ if (-not [string]::IsNullOrEmpty($ScriptFeature)){
                     }
                 }
                 $Scripts = $Scripts | Select-Object 'Script Name','Author','Approver','Approval State','Last Update Time'
-                Write-HtmlTable -InputObject $Scripts -Border 1 -Level 3 -File $FilePath
+                if ($Scripts.Count -gt 0){
+                    Write-HtmlTable -InputObject $Scripts -Border 1 -Level 3 -File $FilePath
+                }else{
+                    Write-HTMLParagraph -Text "No Non-System Scripts are defined in this site." -Level 3 -File $FilePath
+                }
             }
         }
     }else{
@@ -6002,15 +7986,15 @@ if (-not [string]::IsNullOrEmpty($ScriptFeature)){
 }else{
     Write-HTMLParagraph -Text "Scripts feature not found in this site. Scripts were introduced with release 1706." -Level 3 -File $FilePath
 }
-Write-Verbose "$(Get-Date):   Completed Configuration Manager Scripts"
+Write-ProgressEx -CurrentOperation 'Completed Configuration Manager Scripts'
 Write-HtmliLink -ReturnTOC -File $FilePath
 #endregion Scripts
 
-
 #endregion Software Library
+Write-ProgressEx -CurrentOperation 'Completed Software Library'
 
 #region Statistics
-Write-Verbose "$(Get-Date):   Writing final Script Statistics."
+Write-ProgressEx -CurrentOperation 'Writing final Script Statistics'
 Write-HTMLHeading -Level 1 -PageBreak -Text 'Documentation Script Execution Details' -File $FilePath
 Set-Location -Path "$StartingPath"
 $ScriptEndTime = Get-date
@@ -6030,4 +8014,4 @@ Write-HTMLFooter -File $FilePath
 Write-HTMLTOC -InputObject $Global:DocTOC -File $FilePath
 
 Write-host "Completed execution at: $($ScriptEndTime.ToShortTimeString())."
-Write-Host "Total execution time: $ExecTimeString" 
+Write-Host "Total execution time: $ExecTimeString"
